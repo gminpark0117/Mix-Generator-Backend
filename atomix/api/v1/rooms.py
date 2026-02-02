@@ -8,10 +8,10 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Response, 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from atomix.core import get_db
-from atomix.schemas.room import RoomCreateIn, RoomRenameIn, RoomOut, RoomListOut
+from atomix.schemas.room import RoomRenameIn, RoomOut, RoomListOut
 from atomix.services.room_service import RoomService
 from atomix.runtime.presence import room_presence
-from atomix.api.v1.ws_rooms import _ROOM_RUNTIME, RoomOp, _process_room_ops, RoomRuntime
+from atomix.api.v1.ws_rooms import _ROOM_RUNTIME, RoomOp, _process_room_ops, RoomRuntime, FileData
 
 router = APIRouter()
 
@@ -30,7 +30,7 @@ def _build_room_out(room, participant_count: int | None = None) -> RoomOut:
 
 @router.post("", response_model=RoomOut)
 async def create_room(
-    body: RoomCreateIn,
+    name: str = Form(...),
     files: list[UploadFile] = File(...),
     tracks_metadata: str = Form(...),
     db: AsyncSession = Depends(get_db),
@@ -38,7 +38,7 @@ async def create_room(
     svc = RoomService(db)
     try:
         room = await svc.create_room(
-            name=body.name,
+            name=name,
             files=files,
             tracks_metadata=tracks_metadata,
         )
@@ -73,6 +73,32 @@ async def rename_room(
     return _build_room_out(room)
 
 
+@router.delete("/{room_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_room(
+    room_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """
+    Soft-delete a room (for debugging purposes).
+    Sets deleted_at timestamp and cleans up runtime state.
+    """
+    from atomix.api.v1.ws_rooms import _close_all_websockets
+    
+    svc = RoomService(db)
+    room = await svc.delete_room(room_id)
+    if room is None:
+        raise HTTPException(status_code=404, detail="room not found")
+    
+    # Close all WebSocket connections for this room
+    await _close_all_websockets(room_id, reason="room deleted")
+    
+    # Clean up runtime state
+    _ROOM_RUNTIME.pop(room_id, None)
+    room_presence.pop(room_id, None)
+    
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.post("/{room_id}/tracks:upload", status_code=status.HTTP_204_NO_CONTENT)
 async def upload_room_tracks(
     room_id: uuid.UUID,
@@ -90,6 +116,16 @@ async def upload_room_tracks(
     if room is None:
         raise HTTPException(status_code=404, detail="room not found")
 
+    # Read file data immediately (before files are closed by FastAPI)
+    file_data_list = []
+    for upload in files:
+        data = await upload.read()
+        file_data_list.append(FileData(
+            filename=upload.filename or "unknown",
+            content_type=upload.content_type or "application/octet-stream",
+            data=data,
+        ))
+
     # Get or create room runtime
     rt = _ROOM_RUNTIME.get(room_id)
     if rt is None:
@@ -97,9 +133,9 @@ async def upload_room_tracks(
         rt = RoomRuntime()
         _ROOM_RUNTIME[room_id] = rt
     
-    # Add operation to queue
+    # Add operation to queue (with file data, not UploadFile objects)
     rt.room_ops.append(RoomOp(
-        files=files,
+        files=file_data_list,
         tracks_metadata=tracks_metadata,
     ))
     

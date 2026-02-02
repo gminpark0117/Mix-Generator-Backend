@@ -1,9 +1,9 @@
-# atomix/api/v1/ws_rooms.py
 from __future__ import annotations
 
 import asyncio
 import json
 import uuid
+import io
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Set, Any
@@ -11,6 +11,7 @@ from collections import deque
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, UploadFile
 from fastapi.encoders import jsonable_encoder
+from starlette.datastructures import Headers
 
 from atomix.core.db import AsyncSessionLocal
 from atomix.schemas.ws import (
@@ -38,9 +39,17 @@ def _now_ms() -> int:
 
 
 @dataclass
+class FileData:
+    """In-memory file data for background processing."""
+    filename: str
+    content_type: str
+    data: bytes
+
+
+@dataclass
 class RoomOp:
     """Pending room operation (track upload)."""
-    files: list[UploadFile]
+    files: list[FileData]
     tracks_metadata: str
 
 
@@ -84,6 +93,24 @@ async def _broadcast(rt: RoomRuntime, model: Any) -> None:
         rt.conn_id_by_socket.pop(ws, None)
 
 
+async def _close_all_websockets(room_id: uuid.UUID, reason: str = "room closed") -> None:
+    """
+    Close all WebSocket connections for a room.
+    """
+    rt = _ROOM_RUNTIME.get(room_id)
+    if rt is None:
+        return
+    
+    for ws in list(rt.sockets):
+        try:
+            await ws.close(code=1000, reason=reason)
+        except Exception:
+            pass  # ignore errors when closing
+    
+    rt.sockets.clear()
+    rt.conn_id_by_socket.clear()
+
+
 def _assign_name(rt: RoomRuntime) -> str:
     name = f"user-{rt.next_user_idx}"
     rt.next_user_idx += 1
@@ -113,26 +140,38 @@ async def _process_room_ops(room_id: uuid.UUID) -> None:
         while rt.room_ops:
             op = rt.room_ops.popleft()
             
+            # Process the track upload
             try:
-                # Process the track upload
-                async with AsyncSessionLocal() as db:
-                    mix_svc = MixService(db)
-                    room_svc = RoomService(db)
-                    
-                    # Get room to find mix_id and calculate playhead
+                # First, read room info (using a separate session to avoid transaction conflicts)
+                async with AsyncSessionLocal() as db_read:
+                    room_svc = RoomService(db_read)
                     room = await room_svc.get_room(room_id)
                     if room is None:
                         continue
-                    
-                    # Calculate client playhead from server time
-                    now_ms = _now_ms()
-                    client_playhead_ms = now_ms - room.play_started_at_epoch_ms
-                    
-                    # Add tracks to mix
+                    mix_id = room.mix_id
+                    play_started_at_epoch_ms = room.play_started_at_epoch_ms
+                
+                # Calculate client playhead from server time
+                now_ms = _now_ms()
+                client_playhead_ms = now_ms - play_started_at_epoch_ms
+                
+                # Then, add tracks to mix (using a fresh session with its own transaction)
+                # Convert FileData back to UploadFile-like objects
+                upload_files = []
+                for fd in op.files:
+                    # Create an UploadFile from bytes
+                    upload_files.append(UploadFile(
+                        file=io.BytesIO(fd.data),
+                        filename=fd.filename,
+                        headers=Headers({"content-type": fd.content_type})
+                    ))
+                
+                async with AsyncSessionLocal() as db_write:
+                    mix_svc = MixService(db_write)
                     result = await mix_svc.add_tracks_to_mix(
-                        mix_id=room.mix_id,
+                        mix_id=mix_id,
                         client_playhead_ms=client_playhead_ms,
-                        files=op.files,
+                        files=upload_files,
                         tracks_metadata=op.tracks_metadata,
                     )
                 
@@ -146,6 +185,8 @@ async def _process_room_ops(room_id: uuid.UUID) -> None:
             except Exception as e:
                 # Log error but continue processing queue
                 print(f"Error processing room op for room {room_id}: {e}")
+                import traceback
+                traceback.print_exc()
                 
     finally:
         rt.processing_ops = False
@@ -176,6 +217,9 @@ async def _cleanup_empty_rooms() -> None:
         # Clean up idle rooms
         for room_id in rooms_to_delete:
             try:
+                # Close all WebSocket connections
+                await _close_all_websockets(room_id, reason="room cleaned up due to inactivity")
+                
                 # Soft-delete room from DB
                 async with AsyncSessionLocal() as db:
                     room_svc = RoomService(db)
@@ -207,18 +251,14 @@ async def room_ws(room_id: uuid.UUID, websocket: WebSocket):
         if rt is None:
             rt = RoomRuntime()
             _ROOM_RUNTIME[room_id] = rt
-
-        # Register connection
-        rt.sockets.add(websocket)
+        
+        # Register connection (but don't add to rt.sockets yet)
         conn_id = str(uuid.uuid4())
-        rt.conn_id_by_socket[websocket] = conn_id
         your_name = _assign_name(rt)
         rt.conn_id_to_name[conn_id] = your_name
 
         room_presence[room_id].add(conn_id)
         rt.last_activity_time = _utc_now()
-
-        await _broadcast_participant_count(room_id, rt)
 
         # Build mix snapshot
         try:
@@ -247,6 +287,11 @@ async def room_ws(room_id: uuid.UUID, websocket: WebSocket):
             chat_recent=rt.chat_recent[-50:],
         )
         await websocket.send_json(jsonable_encoder(snapshot))
+
+        # Now add to sockets and broadcast to others
+        rt.sockets.add(websocket)
+        rt.conn_id_by_socket[websocket] = conn_id
+        await _broadcast_participant_count(room_id, rt)
 
         try:
             while True:

@@ -21,4 +21,4 @@ class Room(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     play_started_at_epoch_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=True)
