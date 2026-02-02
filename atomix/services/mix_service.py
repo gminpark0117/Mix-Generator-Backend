@@ -8,8 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from atomix.repos.audio_asset_repo import AudioAssetRepo
 from atomix.repos.mix_repo import MixRepo
 from atomix.services.storage_service import StorageService
-from atomix.services.mix_renderer import PlaceholderMixRenderer, TrackInput
+from atomix.renderers.mix_renderer import PlaceholderMixRenderer, TrackInput
+from atomix.analyzers.mix_analyzer import PlaceholderMixAnalyzer
 from atomix.schemas.mix import MixStateOut, MixRevisionResponse, RevisionOut, SegmentOut
+from atomix.core.config import settings
 
 
 def parse_tracks_metadata(tracks_metadata: str, n_files: int) -> list[dict]:
@@ -43,6 +45,7 @@ class MixService:
 
         self.storage = StorageService()
         self.renderer = PlaceholderMixRenderer()  # swap later with real renderer
+        self.analyzer = PlaceholderMixAnalyzer()  # swap later with real analyzer
 
     async def create_mix(self, *, files: list[UploadFile], tracks_metadata: str) -> MixRevisionResponse:
         metas = parse_tracks_metadata(tracks_metadata, len(files))
@@ -53,7 +56,6 @@ class MixService:
 
             # 2) persist sources => audio_assets(kind=source) + mix_items
             track_inputs: list[TrackInput] = []
-            created_items: list[tuple[uuid.UUID, dict]] = []
 
             for up, meta in zip(files, metas):
                 stored = await self.storage.save_upload(up, kind="source")
@@ -62,22 +64,22 @@ class MixService:
                     storage_url=stored.url,
                     mime=stored.mime,
                 )
+                analysis_result = await self.analyzer.analyze(stored.abs_path, meta)
                 item = await self.mixes.add_mix_item(
                     mix_id=mix.id,
                     source_audio_asset_id=src_asset.id,
-                    metadata_json=meta,
-                    analysis_json=None,
+                    metadata_json=analysis_result.metadata_json,
+                    analysis_json=analysis_result.analysis_json,
                 )
-                created_items.append((item.id, meta))
                 track_inputs.append(TrackInput(
                     mix_item_id=item.id,
                     abs_path=stored.abs_path,
-                    song_name=meta["song_name"],
-                    artist_name=meta["artist_name"],
+                    metadata_json=analysis_result.metadata_json,
+                    analysis_json=analysis_result.analysis_json,
                 ))
 
             # 3) render mix (placeholder)
-            render_result = await self.renderer.render(track_inputs)
+            render_result = await self.renderer.render(track_inputs, [])
 
             # 4) persist rendered mix => audio_assets(kind=mix)
             mix_obj = await self.storage.save_bytes(
@@ -121,19 +123,17 @@ class MixService:
 
         # Build response tracklist from metas + segment specs
         # (In a later iteration, you can fetch segments from DB and join metadata.)
-        seg_out: list[SegmentOut] = []
-        id_to_meta = {mid: meta for (mid, meta) in created_items}
-
-        for s in render_result.segments:
-            meta = id_to_meta[s.mix_item_id]
-            seg_out.append(SegmentOut(
+        seg_out: list[SegmentOut] = [
+            SegmentOut(
                 position=s.position,
                 start_ms=s.start_ms,
                 end_ms=s.end_ms,
                 source_start_ms=s.source_start_ms,
-                song_name=meta["song_name"],
-                artist_name=meta["artist_name"],
-            ))
+                song_name=s.song_name,
+                artist_name=s.artist_name,
+            )
+            for s in render_result.segments
+        ]
 
         return MixRevisionResponse(
             mix_id=str(mix.id),
@@ -190,4 +190,157 @@ class MixService:
                 audio_url=asset.storage_url,
             ),
             tracklist=tracklist,
+        )
+
+    async def add_tracks_to_mix(
+        self,
+        *,
+        mix_id: uuid.UUID,
+        client_playhead_ms: int,
+        files: list[UploadFile],
+        tracks_metadata: str,
+    ) -> MixRevisionResponse:
+        """Add new tracks to an existing mix and render a new revision."""
+        metas = parse_tracks_metadata(tracks_metadata, len(files))
+
+        async with self.db.begin():
+            # Get current mix state
+            mix = await self.mixes.get_mix(mix_id)
+            if mix is None:
+                raise KeyError("mix not found")
+
+            # Get current revision for reference
+            if mix.current_ready_revision_no is None:
+                raise ValueError("mix has no current revision")
+            
+            current_rev = await self.mixes.get_revision_by_no(mix_id, mix.current_ready_revision_no)
+            if current_rev is None:
+                raise RuntimeError("current revision not found")
+
+            # 1) Persist new source files and add to track_inputs
+            track_inputs: list[TrackInput] = []
+            new_item_ids: set[uuid.UUID] = set()
+
+            for up, meta in zip(files, metas):
+                stored = await self.storage.save_upload(up, kind="source")
+                src_asset = await self.assets.create(
+                    kind="source",
+                    storage_url=stored.url,
+                    mime=stored.mime,
+                )
+                # Analyze track
+                analysis_result = await self.analyzer.analyze(stored.abs_path, meta)
+                item = await self.mixes.add_mix_item(
+                    mix_id=mix_id,
+                    source_audio_asset_id=src_asset.id,
+                    metadata_json=analysis_result.metadata_json,
+                    analysis_json=analysis_result.analysis_json,
+                )
+                new_item_ids.add(item.id)
+                track_inputs.append(TrackInput(
+                    mix_item_id=item.id,
+                    abs_path=stored.abs_path,
+                    metadata_json=analysis_result.metadata_json,
+                    analysis_json=analysis_result.analysis_json,
+                ))
+
+            # 2) Get all mix items (old + new)
+            all_items = await self.mixes.list_mix_items(mix_id)
+            
+            for item in all_items:
+                # Skip new items (already in track_inputs)
+                if item.id not in new_item_ids:
+                    # Fetch audio asset to get storage_url, then reconstruct abs_path
+                    asset = await self.assets.get(item.source_audio_asset_id)
+                    if asset is None:
+                        continue  # skip if asset missing
+                    
+                    # Extract key from storage_url by removing base_url prefix
+                    key = asset.storage_url.removeprefix(self.storage.base_url).lstrip("/")
+                    abs_path = str(self.storage.abs_path(key))
+                    
+                    track_inputs.append(TrackInput(
+                        mix_item_id=item.id,
+                        abs_path=abs_path,
+                        metadata_json=item.metadata_json,
+                        analysis_json=item.analysis_json,
+                    ))
+
+            # 3) Determine fixed tracks
+            freeze_ms = client_playhead_ms + settings.LOOKAHEAD_MS
+            fixed_track_ids: set[uuid.UUID] = set()
+
+            current_segments = await self.mixes.list_segments_for_revision(current_rev.id)
+            for seg in current_segments:
+                if seg.start_ms < freeze_ms:
+                    fixed_track_ids.add(seg.mix_item_id)
+
+            fixed_tracks = [t for t in track_inputs if t.mix_item_id in fixed_track_ids]
+
+            # 4) Render new mix
+            render_result = await self.renderer.render(track_inputs, fixed_tracks)
+
+            # 5) Persist rendered mix => audio_assets(kind=mix)
+            mix_obj = await self.storage.save_bytes(
+                render_result.audio_bytes,
+                kind="mix",
+                mime=render_result.mime,
+                ext=".wav",
+            )
+            mix_asset = await self.assets.create(
+                kind="mix",
+                storage_url=mix_obj.url,
+                mime=mix_obj.mime,
+            )
+
+            # 6) Create new revision
+            new_revision_no = mix.current_ready_revision_no + 1
+            rev = await self.mixes.create_revision(
+                mix_id=mix_id,
+                revision_no=new_revision_no,
+                switchover_ms=freeze_ms,
+                length_ms=render_result.length_ms,
+                audio_asset_id=mix_asset.id,
+            )
+
+            # 7) Create segments for new revision
+            await self.mixes.add_segments(
+                mix_revision_id=rev.id,
+                segments=[
+                    {
+                        "position": s.position,
+                        "mix_item_id": s.mix_item_id,
+                        "start_ms": s.start_ms,
+                        "end_ms": s.end_ms,
+                        "source_start_ms": s.source_start_ms,
+                    }
+                    for s in render_result.segments
+                ],
+            )
+
+            # 8) Update mix pointer
+            await self.mixes.set_current_ready_revision_no(mix, new_revision_no)
+
+        # Build response
+        seg_out: list[SegmentOut] = [
+            SegmentOut(
+                position=s.position,
+                start_ms=s.start_ms,
+                end_ms=s.end_ms,
+                source_start_ms=s.source_start_ms,
+                song_name=s.song_name,
+                artist_name=s.artist_name,
+            )
+            for s in render_result.segments
+        ]
+
+        return MixRevisionResponse(
+            mix_id=str(mix_id),
+            revision=RevisionOut(
+                revision_no=new_revision_no,
+                switchover_ms=freeze_ms,
+                length_ms=render_result.length_ms,
+                audio_url=mix_obj.url,
+            ),
+            tracklist=seg_out,
         )

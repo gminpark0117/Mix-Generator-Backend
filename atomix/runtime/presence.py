@@ -1,4 +1,6 @@
 from collections import defaultdict
+import uuid
 
-# room_id -> set(conn_id)
-presence = defaultdict(set)
+
+# room_id -> set(connection_ids)
+room_presence: defaultdict[uuid.UUID, set[str]] = defaultdict(set)

@@ -11,8 +11,8 @@ import uuid
 class TrackInput:
     mix_item_id: uuid.UUID
     abs_path: str               # stored source file path (not used by placeholder)
-    song_name: str
-    artist_name: str
+    metadata_json: dict
+    analysis_json: dict | None
 
 @dataclass(frozen=True)
 class SegmentSpec:
@@ -21,6 +21,8 @@ class SegmentSpec:
     start_ms: int
     end_ms: int
     source_start_ms: int
+    song_name: str
+    artist_name: str
 
 @dataclass(frozen=True)
 class RenderResult:
@@ -30,7 +32,7 @@ class RenderResult:
     segments: list[SegmentSpec]
 
 class MixRenderer(Protocol):
-    async def render(self, tracks: list[TrackInput]) -> RenderResult:
+    async def render(self, tracks: list[TrackInput], fixed_tracks: list[TrackInput]) -> RenderResult:
         ...
 
 class PlaceholderMixRenderer:
@@ -45,19 +47,22 @@ class PlaceholderMixRenderer:
     CHANNELS = 2
     SAMPWIDTH = 2  # bytes per sample
 
-    async def render(self, tracks: list[TrackInput]) -> RenderResult:
+    async def render(self, tracks: list[TrackInput], fixed_tracks: list[TrackInput]) -> RenderResult:
         n = len(tracks)
         length_ms = max(1, n) * self.PER_TRACK_MS  # avoid 0ms mixes
 
         segments: list[SegmentSpec] = []
         t = 0
         for i, tr in enumerate(tracks):
+            meta = tr.metadata_json or {}
             segments.append(SegmentSpec(
                 position=i,
                 mix_item_id=tr.mix_item_id,
                 start_ms=t,
                 end_ms=t + self.PER_TRACK_MS,
                 source_start_ms=0,
+                song_name=str(meta.get("song_name", "")),
+                artist_name=str(meta.get("artist_name", "")),
             ))
             t += self.PER_TRACK_MS
 

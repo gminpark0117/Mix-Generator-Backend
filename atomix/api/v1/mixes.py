@@ -20,15 +20,28 @@ async def create_mix(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.post("/{mix_id}/tracks:upload")
+@router.post("/{mix_id}/tracks:upload", response_model=MixRevisionResponse)
 async def add_tracks_to_mix(
-    mix_id: str,
+    mix_id: uuid.UUID,
     client_playhead_ms: int = Form(...),
     files: list[UploadFile] = File(...),
     tracks_metadata: str = Form(...),
+    db: AsyncSession = Depends(get_db),
 ):
-    # TODO: store/analyze items, compute switchover = playhead + LOOKAHEAD_MS, render new revision
-    return {"todo": True}
+    svc = MixService(db)
+    try:
+        return await svc.add_tracks_to_mix(
+            mix_id=mix_id,
+            client_playhead_ms=client_playhead_ms,
+            files=files,
+            tracks_metadata=tracks_metadata,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="mix not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{mix_id}", response_model=MixStateOut)
 async def get_mix(

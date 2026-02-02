@@ -46,4 +46,9 @@ class RevisionReadyOut(BaseModel):
     tracklist: List[SegmentOut] = []
 
 
-ServerToClient = Union[RoomSnapshotOut, ChatMessageOut, RevisionReadyOut]
+class ParticipantCountUpdateOut(BaseModel):
+    type: Literal["participant_count_update"] = "participant_count_update"
+    participant_count: int
+
+
+ServerToClient = Union[RoomSnapshotOut, ChatMessageOut, RevisionReadyOut, ParticipantCountUpdateOut]

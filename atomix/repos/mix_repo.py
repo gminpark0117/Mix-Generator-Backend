@@ -47,6 +47,10 @@ class MixRepo:
         await self.db.flush()
         return item
 
+    async def list_mix_items(self, mix_id: uuid.UUID) -> list[MixItem]:
+        res = await self.db.execute(select(MixItem).where(MixItem.mix_id == mix_id))
+        return list(res.scalars().all())
+
     # --- mix_revisions ---
     async def create_revision(
         self,
