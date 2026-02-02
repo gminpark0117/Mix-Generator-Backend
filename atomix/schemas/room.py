@@ -1,0 +1,24 @@
+from __future__ import annotations
+
+from datetime import datetime
+from pydantic import BaseModel
+from typing import List
+
+
+class RoomCreateIn(BaseModel):
+    name: str
+
+
+class RoomRenameIn(BaseModel):
+    name: str
+
+
+class RoomOut(BaseModel):
+    room_id: str
+    name: str
+    created_at: datetime
+    participant_count: int = 0
+
+
+class RoomListOut(BaseModel):
+    rooms: List[RoomOut]

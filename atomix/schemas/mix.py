@@ -13,7 +13,6 @@ class RevisionOut(BaseModel):
 
 class SegmentOut(BaseModel):
     position: int
-    mix_item_id: str
     start_ms: int
     end_ms: int
     source_start_ms: int

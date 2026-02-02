@@ -1,0 +1,446 @@
+---
+openapi: 3.1.0
+info:
+  title: atomix API
+  version: 0.1.0
+paths:
+  "/v1/mixes":
+    post:
+      tags:
+      - mixes
+      summary: Create Mix
+      operationId: create_mix_v1_mixes_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              "$ref": "#/components/schemas/Body_create_mix_v1_mixes_post"
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/MixRevisionResponse"
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HTTPValidationError"
+  "/v1/mixes/{mix_id}/tracks:upload":
+    post:
+      tags:
+      - mixes
+      summary: Add Tracks To Mix
+      operationId: add_tracks_to_mix_v1_mixes__mix_id__tracks_upload_post
+      parameters:
+      - name: mix_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Mix Id
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              "$ref": "#/components/schemas/Body_add_tracks_to_mix_v1_mixes__mix_id__tracks_upload_post"
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HTTPValidationError"
+  "/v1/mixes/{mix_id}":
+    get:
+      tags:
+      - mixes
+      summary: Get Mix
+      operationId: get_mix_v1_mixes__mix_id__get
+      parameters:
+      - name: mix_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Mix Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/MixStateOut"
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HTTPValidationError"
+  "/v1/mixes/{mix_id}/revisions/{revision_no}":
+    get:
+      tags:
+      - mixes
+      summary: Get Mix Revision
+      operationId: get_mix_revision_v1_mixes__mix_id__revisions__revision_no__get
+      parameters:
+      - name: mix_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Mix Id
+      - name: revision_no
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Revision No
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/MixRevisionResponse"
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HTTPValidationError"
+  "/v1/rooms":
+    get:
+      tags:
+      - rooms
+      summary: List Rooms
+      operationId: list_rooms_v1_rooms_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/RoomListOut"
+    post:
+      tags:
+      - rooms
+      summary: Create Room
+      operationId: create_room_v1_rooms_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/RoomCreateIn"
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/RoomOut"
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HTTPValidationError"
+  "/v1/rooms/{room_id}":
+    patch:
+      tags:
+      - rooms
+      summary: Rename Room
+      operationId: rename_room_v1_rooms__room_id__patch
+      parameters:
+      - name: room_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Room Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/RoomRenameIn"
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/RoomOut"
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HTTPValidationError"
+  "/v1/rooms/{room_id}/tracks:upload":
+    post:
+      tags:
+      - rooms
+      summary: Upload Room Tracks
+      description: |-
+        Stub endpoint: accept uploads + metadata and return empty response.
+        Later, this should:
+          - save files (StorageService)
+          - insert audio_assets/mix_items
+          - render new revision
+          - broadcast revision_ready over WS
+      operationId: upload_room_tracks_v1_rooms__room_id__tracks_upload_post
+      parameters:
+      - name: room_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Room Id
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              "$ref": "#/components/schemas/Body_upload_room_tracks_v1_rooms__room_id__tracks_upload_post"
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HTTPValidationError"
+components:
+  schemas:
+    Body_add_tracks_to_mix_v1_mixes__mix_id__tracks_upload_post:
+      properties:
+        client_playhead_ms:
+          type: integer
+          title: Client Playhead Ms
+        files:
+          items:
+            type: string
+            format: binary
+          type: array
+          title: Files
+        tracks_metadata:
+          type: string
+          title: Tracks Metadata
+      type: object
+      required:
+      - client_playhead_ms
+      - files
+      - tracks_metadata
+      title: Body_add_tracks_to_mix_v1_mixes__mix_id__tracks_upload_post
+    Body_create_mix_v1_mixes_post:
+      properties:
+        files:
+          items:
+            type: string
+            format: binary
+          type: array
+          title: Files
+        tracks_metadata:
+          type: string
+          title: Tracks Metadata
+      type: object
+      required:
+      - files
+      - tracks_metadata
+      title: Body_create_mix_v1_mixes_post
+    Body_upload_room_tracks_v1_rooms__room_id__tracks_upload_post:
+      properties:
+        files:
+          items:
+            type: string
+            format: binary
+          type: array
+          title: Files
+        tracks_metadata:
+          type: string
+          title: Tracks Metadata
+      type: object
+      required:
+      - files
+      - tracks_metadata
+      title: Body_upload_room_tracks_v1_rooms__room_id__tracks_upload_post
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            "$ref": "#/components/schemas/ValidationError"
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    MixRevisionResponse:
+      properties:
+        mix_id:
+          type: string
+          title: Mix Id
+        revision:
+          "$ref": "#/components/schemas/RevisionOut"
+        tracklist:
+          items:
+            "$ref": "#/components/schemas/SegmentOut"
+          type: array
+          title: Tracklist
+      type: object
+      required:
+      - mix_id
+      - revision
+      - tracklist
+      title: MixRevisionResponse
+    MixStateOut:
+      properties:
+        mix_id:
+          type: string
+          title: Mix Id
+        current_ready_revision_no:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Current Ready Revision No
+      type: object
+      required:
+      - mix_id
+      - current_ready_revision_no
+      title: MixStateOut
+    RevisionOut:
+      properties:
+        revision_no:
+          type: integer
+          title: Revision No
+        switchover_ms:
+          type: integer
+          title: Switchover Ms
+        length_ms:
+          type: integer
+          title: Length Ms
+        audio_url:
+          type: string
+          title: Audio Url
+      type: object
+      required:
+      - revision_no
+      - switchover_ms
+      - length_ms
+      - audio_url
+      title: RevisionOut
+    RoomCreateIn:
+      properties:
+        name:
+          type: string
+          title: Name
+      type: object
+      required:
+      - name
+      title: RoomCreateIn
+    RoomListOut:
+      properties:
+        rooms:
+          items:
+            "$ref": "#/components/schemas/RoomOut"
+          type: array
+          title: Rooms
+      type: object
+      required:
+      - rooms
+      title: RoomListOut
+    RoomOut:
+      properties:
+        room_id:
+          type: string
+          title: Room Id
+        name:
+          type: string
+          title: Name
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        participant_count:
+          type: integer
+          title: Participant Count
+          default: 0
+      type: object
+      required:
+      - room_id
+      - name
+      - created_at
+      title: RoomOut
+    RoomRenameIn:
+      properties:
+        name:
+          type: string
+          title: Name
+      type: object
+      required:
+      - name
+      title: RoomRenameIn
+    SegmentOut:
+      properties:
+        position:
+          type: integer
+          title: Position
+        start_ms:
+          type: integer
+          title: Start Ms
+        end_ms:
+          type: integer
+          title: End Ms
+        source_start_ms:
+          type: integer
+          title: Source Start Ms
+        song_name:
+          type: string
+          title: Song Name
+        artist_name:
+          type: string
+          title: Artist Name
+      type: object
+      required:
+      - position
+      - start_ms
+      - end_ms
+      - source_start_ms
+      - song_name
+      - artist_name
+      title: SegmentOut
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
