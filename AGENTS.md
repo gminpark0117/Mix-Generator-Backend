@@ -1,69 +1,67 @@
-Task: Update MixAnalyzer to improve performance by (1) removing full-track HPSS and running HPSS only inside switch windows, (2) using fast resampling on audio load, and (3) removing RMS/energy info from outputs only (keep RMS internally for window selection unchanged).
+TASK: Implement deterministic MixRenderer (ordering + bar-aligned beatmatching)
 
-A) Performance refactor: remove full-track HPSS
+A) Contracts + validation
 
-In _analyze_sync, delete the full-track call:
+Implement a real renderer in mix_renderer.py (keep PlaceholderMixRenderer intact).
+Define “track identity” as TrackInput.mix_item_id and validate:
+fixed_tracks is a subset of tracks (ignore/raise if not; choose one behavior and document).
+No duplicates; preserve the exact order of fixed_tracks as the required prefix.
+Validate analysis presence:
+If any TrackInput.analysis_json is missing/invalid, fallback to deterministic “append order only” + simple crossfades.
+B) Analysis extraction helpers (local-first)
 
-y_harm, y_perc = librosa.effects.hpss(y)
+Add helper functions to extract, for each track:
+switch_in and switch_out blocks
+rhythm: bpm_local, bpm_candidates, meter, downbeats_s, beats_s, signature.phase.pattern, signature.phase.stability, signature.periodicity.tempogram_top_peaks
+harmony: key.tonic, key.mode, key.confidence
+quality components: onset_clarity, tempo_stability, spectral_flux, chroma_flux, energy_ramp
+C) Transition scoring (MOST IMPORTANT: tempo)
 
-Full-track feature computation must still happen, but without HPSS:
+Implement compute_transition_options(A_out, B_in) -> list[TransitionOption]:
+Evaluate tempo mapping using bpm_candidates (and optionally tempo_scale_used as a prior).
+Pick best option by minimizing abs(delta_bpm_pct); hard-penalize if > ~6%.
+Add secondary penalties:
+key distance (weighted down if either key confidence is low) -- use music-theoretic notions, such as circle of fifths
+signature mismatch (cosine similarity on phase.pattern; compare peak BPM sets from tempogram_top_peaks)
+instability penalty using phase.stability.bar_to_bar_var
+Determinism: all ties broken by (delta_bpm_pct, secondary_cost, mix_item_id).
+D) Ordering with fixed prefix
 
-Keep computing onset_env_full / onset_times_full (can be based on raw y instead of y_perc).
+Build final order:
+prefix = fixed_tracks (exact order)
+remaining = [t for t in tracks if t.mix_item_id not in prefix_ids]
+Optimize order of remaining starting from the last prefix track:
+Build pairwise transition costs using C).
+Use an exact solver for small N (bitmask DP/Held–Karp up to e.g. 10), otherwise deterministic greedy.
+Final order = prefix + optimized_remaining.
+E) Build a deterministic “mix plan” (no audio yet)
 
-Keep global beat tracking (beats_s_full) from the full-track onset envelope.
+For each adjacent pair (A->B), decide:
+chosen tempo mapping (which BPM candidate on B)
+target “mix BPM” (usually A.switch_out bpm)
+overlap length in bars (longer when compatible; short when key/signature clash)
+alignment anchors: downbeat-to-downbeat if available, else beat-to-beat fallback
+F) Audio rendering (MVP)
 
-Keep full-track spectral/chroma flux computations (do not remove them; only adjust inputs if needed because y_harm/y_perc no longer exist).
+Render SR: fixed (e.g. 44100), stereo float32 internal.
+For each track:
+load audio (soundfile or librosa), resample to render SR
+select source regions based on switch windows (start near switch_in.start_s, end near switch_out.end_s)
+For each transition A->B:
+time-stretch B’s incoming region to target BPM (clamp stretch ratio)
+align on bar boundaries using downbeats_s + meter.beats_per_bar (fallback to nearest beat)
+equal-power crossfade over overlap region
+“one bass at a time” MVP: apply simple HPF on incoming during early overlap, then release (scipy butter + lfilter)
+G) Output + segments
 
-Modify _analyze_section so HPSS happens only on the section audio:
+Produce:
+RenderResult.audio_bytes as WAV (16-bit PCM) deterministically
+segments: list[SegmentSpec] with per-track start_ms/end_ms/source_start_ms (consistent even with overlaps)
+Acceptance criteria (initial)
 
-Inside _analyze_section, after slicing y_section, compute:
+Respects fixed prefix exactly; deterministic order for remaining tracks.
+Tempo compatibility dominates ordering decisions (local section BPMs).
+Transitions align on downbeats when present; fall back cleanly when not.
+Renderer is deterministic (no randomness; stable tie-breaks).
+Produces valid WAV bytes + segments list for DB persistence.
 
-y_harm_section, y_perc_section = librosa.effects.hpss(y_section)
-
-Use y_perc_section for section onset/beat tracking and y_harm_section for harmony features, as before.
-
-Update function signatures / call sites accordingly (remove passing y_harm/y_perc from full track).
-
-B) Faster audio loading
-
-Change the load call to:
-
-librosa.load(abs_path, sr=self.analysis_sr, mono=True, res_type="kaiser_fast")
-
-C) Output change only: remove RMS/energy fields from JSON
-
-Important: Keep RMS analysis for window selection logic intact. Do not change _rms_curve usage in _score_window / _select_switch_window except to stop emitting values.
-
-In the final analysis_json, remove RMS-derived output fields:
-
-Remove track.overview.rms_mean (and any other RMS summary fields if present).
-
-In per-section outputs (switch_in, switch_out):
-
-Either omit "energy" entirely or set it to an empty dict {}.
-
-Prefer {} if downstream consumers expect the key to exist.
-
-In _empty_analysis, make the same decision consistently (omit or {}) so schema is stable.
-
-Remove or keep _energy_features based on whether it is still used:
-
-If it becomes unused after removing energy outputs, delete _energy_features and its call sites.
-
-Do not delete _rms_curve because RMS is still used for window selection scoring.
-
-D) Beat logic note
-
-Keep both global and local beat tracking as currently implemented (including _choose_beats).
-
-The global beat tracker no longer depends on HPSS; it should still exist for candidate generation and fallback.
-
-_choose_beats should be modified so that it prefers the local beat tracking, than the global one. 
-
-Deliverable: Updated code for MixAnalyzer that compiles and preserves existing analysis behavior, except:
-
-HPSS no longer runs on the full track (only per switch window)
-
-audio load uses kaiser_fast
-
-RMS/energy is no longer included in outputs (but RMS scoring for window selection remains)

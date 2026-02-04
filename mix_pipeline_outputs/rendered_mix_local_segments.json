@@ -1,0 +1,235 @@
+{
+  "analyzer_variant": "local",
+  "analysis_sr": 22050,
+  "hop_length": 512,
+  "input_directory": "C:\\Users\\gminp\\Mix-Generator-Backend\\testmusic",
+  "input_tracks": [
+    {
+      "mix_item_id": "06eb8ee5-bcbb-5e34-b780-4bf3e1559326",
+      "abs_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\testmusic\\Give It To Me 4.mp3",
+      "metadata_json": {
+        "song_name": "Give It To Me 4",
+        "artist_name": ""
+      },
+      "analysis_json_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\mix_pipeline_outputs\\analysis_local\\000_Give_It_To_Me_4_analysis_local.json"
+    },
+    {
+      "mix_item_id": "4ece8afe-94c8-540f-a711-0419832681a7",
+      "abs_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\testmusic\\Give It To Me 4_mix_analyzer_clicks_global_hpss.wav",
+      "metadata_json": {
+        "song_name": "Give It To Me 4_mix_analyzer_clicks_global_hpss",
+        "artist_name": ""
+      },
+      "analysis_json_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\mix_pipeline_outputs\\analysis_local\\001_Give_It_To_Me_4_mix_analyzer_clicks_global_hpss_analysis_local.json"
+    },
+    {
+      "mix_item_id": "3b3cd6d2-8f0a-5546-8574-27e502b62907",
+      "abs_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\testmusic\\Magalenha.mp3",
+      "metadata_json": {
+        "song_name": "Magalenha",
+        "artist_name": ""
+      },
+      "analysis_json_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\mix_pipeline_outputs\\analysis_local\\002_Magalenha_analysis_local.json"
+    },
+    {
+      "mix_item_id": "1dc3c696-6fb5-51da-ab86-2172ae5e13c6",
+      "abs_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\testmusic\\One More Time 4.mp3",
+      "metadata_json": {
+        "song_name": "One More Time 4",
+        "artist_name": ""
+      },
+      "analysis_json_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\mix_pipeline_outputs\\analysis_local\\003_One_More_Time_4_analysis_local.json"
+    },
+    {
+      "mix_item_id": "ac0a296c-85f5-5123-a217-d54fd4a65181",
+      "abs_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\testmusic\\People Ain't Dancing 4.mp3",
+      "metadata_json": {
+        "song_name": "People Ain't Dancing 4",
+        "artist_name": ""
+      },
+      "analysis_json_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\mix_pipeline_outputs\\analysis_local\\004_People_Ain_t_Dancing_4_analysis_local.json"
+    },
+    {
+      "mix_item_id": "4f950ce9-66d8-5377-98e8-0e9f15a312c2",
+      "abs_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\testmusic\\Sete.mp3",
+      "metadata_json": {
+        "song_name": "Sete",
+        "artist_name": ""
+      },
+      "analysis_json_path": "C:\\Users\\gminp\\Mix-Generator-Backend\\mix_pipeline_outputs\\analysis_local\\005_Sete_analysis_local.json"
+    }
+  ],
+  "analysis_output_dir": "C:\\Users\\gminp\\Mix-Generator-Backend\\mix_pipeline_outputs\\analysis_local",
+  "fixed_prefix_count": 0,
+  "output_audio": {
+    "path": "C:\\Users\\gminp\\Mix-Generator-Backend\\mix_pipeline_outputs\\rendered_mix_local.mp3",
+    "mime": "audio/mpeg",
+    "length_ms": 1074875,
+    "bytes": 20602948
+  },
+  "segments": [
+    {
+      "position": 0,
+      "mix_item_id": "06eb8ee5-bcbb-5e34-b780-4bf3e1559326",
+      "start_ms": 0,
+      "end_ms": 179908,
+      "source_start_ms": 0,
+      "song_name": "Give It To Me 4",
+      "artist_name": ""
+    },
+    {
+      "position": 1,
+      "mix_item_id": "4ece8afe-94c8-540f-a711-0419832681a7",
+      "start_ms": 165047,
+      "end_ms": 327679,
+      "source_start_ms": 17369,
+      "song_name": "Give It To Me 4_mix_analyzer_clicks_global_hpss",
+      "artist_name": ""
+    },
+    {
+      "position": 2,
+      "mix_item_id": "3b3cd6d2-8f0a-5546-8574-27e502b62907",
+      "start_ms": 307679,
+      "end_ms": 474995,
+      "source_start_ms": 7059,
+      "song_name": "Magalenha",
+      "artist_name": ""
+    },
+    {
+      "position": 3,
+      "mix_item_id": "4f950ce9-66d8-5377-98e8-0e9f15a312c2",
+      "start_ms": 460134,
+      "end_ms": 643187,
+      "source_start_ms": 17554,
+      "song_name": "Sete",
+      "artist_name": ""
+    },
+    {
+      "position": 4,
+      "mix_item_id": "1dc3c696-6fb5-51da-ab86-2172ae5e13c6",
+      "start_ms": 623187,
+      "end_ms": 941965,
+      "source_start_ms": 1579,
+      "song_name": "One More Time 4",
+      "artist_name": ""
+    },
+    {
+      "position": 5,
+      "mix_item_id": "ac0a296c-85f5-5123-a217-d54fd4a65181",
+      "start_ms": 921965,
+      "end_ms": 1074875,
+      "source_start_ms": 1950,
+      "song_name": "People Ain't Dancing 4",
+      "artist_name": ""
+    }
+  ],
+  "render_debug": {
+    "timing_s": {
+      "canonicalize_tracks": 2.510007470846176e-05,
+      "extract_features": 0.0005585999460890889,
+      "order_tracks": 0.013650499982759356,
+      "build_transition_plan": 0.0023777999449521303,
+      "render_audio": 36.413926400011405,
+      "encode_output": 14.85466319997795,
+      "total": 51.29344470007345
+    },
+    "decisions": {
+      "input_track_ids": [
+        "06eb8ee5-bcbb-5e34-b780-4bf3e1559326",
+        "4ece8afe-94c8-540f-a711-0419832681a7",
+        "3b3cd6d2-8f0a-5546-8574-27e502b62907",
+        "1dc3c696-6fb5-51da-ab86-2172ae5e13c6",
+        "ac0a296c-85f5-5123-a217-d54fd4a65181",
+        "4f950ce9-66d8-5377-98e8-0e9f15a312c2"
+      ],
+      "requested_prefix_ids": [],
+      "unique_track_ids": [
+        "06eb8ee5-bcbb-5e34-b780-4bf3e1559326",
+        "4ece8afe-94c8-540f-a711-0419832681a7",
+        "3b3cd6d2-8f0a-5546-8574-27e502b62907",
+        "1dc3c696-6fb5-51da-ab86-2172ae5e13c6",
+        "ac0a296c-85f5-5123-a217-d54fd4a65181",
+        "4f950ce9-66d8-5377-98e8-0e9f15a312c2"
+      ],
+      "applied_prefix_ids": [],
+      "all_analysis_valid": true,
+      "ordering_strategy": "held_karp_dp",
+      "final_order_ids": [
+        "06eb8ee5-bcbb-5e34-b780-4bf3e1559326",
+        "4ece8afe-94c8-540f-a711-0419832681a7",
+        "3b3cd6d2-8f0a-5546-8574-27e502b62907",
+        "4f950ce9-66d8-5377-98e8-0e9f15a312c2",
+        "1dc3c696-6fb5-51da-ab86-2172ae5e13c6",
+        "ac0a296c-85f5-5123-a217-d54fd4a65181"
+      ],
+      "render_mode": "planned_transitions",
+      "transitions": [
+        {
+          "from_id": "06eb8ee5-bcbb-5e34-b780-4bf3e1559326",
+          "to_id": "4ece8afe-94c8-540f-a711-0419832681a7",
+          "incoming_bpm": 129.1992,
+          "target_bpm": 129.19921874999932,
+          "delta_bpm_pct": 0.0,
+          "stretch_rate": 1.0000001451247325,
+          "secondary_cost": 0.5793379946221053,
+          "total_cost": 5.793379946221053,
+          "overlap_bars": 8,
+          "overlap_s": 14.860770975056768
+        },
+        {
+          "from_id": "4ece8afe-94c8-540f-a711-0419832681a7",
+          "to_id": "3b3cd6d2-8f0a-5546-8574-27e502b62907",
+          "incoming_bpm": 129.1992,
+          "target_bpm": 129.19921874999932,
+          "delta_bpm_pct": 0.0,
+          "stretch_rate": 1.0000001451247325,
+          "secondary_cost": 0.563129531981202,
+          "total_cost": 5.63129531981202,
+          "overlap_bars": 12,
+          "overlap_s": 20.0
+        },
+        {
+          "from_id": "3b3cd6d2-8f0a-5546-8574-27e502b62907",
+          "to_id": "4f950ce9-66d8-5377-98e8-0e9f15a312c2",
+          "incoming_bpm": 123.046875,
+          "target_bpm": 129.19921874999932,
+          "delta_bpm_pct": 0.0,
+          "stretch_rate": 1.0499999999999945,
+          "secondary_cost": 0.3863918907750844,
+          "total_cost": 3.8639189077508442,
+          "overlap_bars": 8,
+          "overlap_s": 14.860770975056768
+        },
+        {
+          "from_id": "4f950ce9-66d8-5377-98e8-0e9f15a312c2",
+          "to_id": "1dc3c696-6fb5-51da-ab86-2172ae5e13c6",
+          "incoming_bpm": 123.046875,
+          "target_bpm": 123.04687500000331,
+          "delta_bpm_pct": 0.0,
+          "stretch_rate": 1.0000000000000269,
+          "secondary_cost": 0.13679159571938915,
+          "total_cost": 1.3679159571938915,
+          "overlap_bars": 12,
+          "overlap_s": 20.0
+        },
+        {
+          "from_id": "1dc3c696-6fb5-51da-ab86-2172ae5e13c6",
+          "to_id": "ac0a296c-85f5-5123-a217-d54fd4a65181",
+          "incoming_bpm": 123.046875,
+          "target_bpm": 123.04687500000331,
+          "delta_bpm_pct": 0.0,
+          "stretch_rate": 1.0000000000000269,
+          "secondary_cost": 0.1672953069838993,
+          "total_cost": 1.672953069838993,
+          "overlap_bars": 12,
+          "overlap_s": 20.0
+        }
+      ],
+      "length_ms": 1074875,
+      "segments_count": 6,
+      "encoded_bytes": 20602948
+    },
+    "fallbacks": [],
+    "errors": []
+  }
+}

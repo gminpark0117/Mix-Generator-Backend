@@ -229,12 +229,13 @@ class MixAnalyzer:
 
     def _load_audio(self, abs_path: str, debug: dict[str, Any]) -> tuple[Any, int]:
         try:
-            return librosa.load(
+            y, sr = librosa.load(
                 abs_path,
                 sr=self.analysis_sr,
                 mono=True,
                 res_type="kaiser_fast",
             )
+            return y, int(sr)
         except ModuleNotFoundError as exc:
             # kaiser_fast depends on resampy in some librosa setups.
             if "resampy" not in str(exc):
@@ -242,12 +243,13 @@ class MixAnalyzer:
             debug["fallbacks"].append("audio_load_resampy_missing_fallback_soxr_hq")
             if self.enable_timing_logs:
                 self.logger.warning("resampy missing; falling back to librosa.load res_type=soxr_hq")
-            return librosa.load(
+            y, sr = librosa.load(
                 abs_path,
                 sr=self.analysis_sr,
                 mono=True,
                 res_type="soxr_hq",
             )
+            return y, int(sr)
 
     def _record_timing(self, debug: dict[str, Any], label: str, start: float) -> None:
         elapsed = float(time.perf_counter() - start)

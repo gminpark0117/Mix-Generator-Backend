@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from atomix.repos.audio_asset_repo import AudioAssetRepo
 from atomix.repos.mix_repo import MixRepo
 from atomix.services.storage_service import StorageService
-from atomix.renderers.mix_renderer import PlaceholderMixRenderer, TrackInput
+from atomix.renderers.mix_renderer import DeterministicMixRenderer, TrackInput
 from atomix.analyzers.mix_analyzer import MixAnalyzer
 from atomix.schemas.mix import MixStateOut, MixRevisionResponse, RevisionOut, SegmentOut
 from atomix.core.config import settings
@@ -44,7 +44,7 @@ class MixService:
         self.mixes = MixRepo(db)
 
         self.storage = StorageService()
-        self.renderer = PlaceholderMixRenderer()  # swap later with real renderer
+        self.renderer = DeterministicMixRenderer(enable_timing_logs=True, enable_debug_logs=True)
         self.analyzer = MixAnalyzer()
 
     async def create_mix(self, *, files: list[UploadFile], tracks_metadata: str) -> MixRevisionResponse:
@@ -78,7 +78,7 @@ class MixService:
                     analysis_json=analysis_result.analysis_json,
                 ))
 
-            # 3) render mix (placeholder)
+            # 3) render mix
             render_result = await self.renderer.render(track_inputs, [])
 
             # 4) persist rendered mix => audio_assets(kind=mix)
@@ -86,7 +86,6 @@ class MixService:
                 render_result.audio_bytes,
                 kind="mix",
                 mime=render_result.mime,
-                ext=".wav",
             )
             mix_asset = await self.assets.create(
                 kind="mix",
@@ -285,7 +284,6 @@ class MixService:
                 render_result.audio_bytes,
                 kind="mix",
                 mime=render_result.mime,
-                ext=".wav",
             )
             mix_asset = await self.assets.create(
                 kind="mix",
