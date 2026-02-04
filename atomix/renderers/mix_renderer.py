@@ -1284,6 +1284,496 @@ class DeterministicMixRenderer:
         return {}
 
 
+class VariableBpmMixRenderer(DeterministicMixRenderer):
+    TEMPO_RAMP_CHUNKS = 16
+    HARD_TEMPO_MISMATCH_PENALTY = 400.0
+
+    def __init__(
+        self,
+        *,
+        enable_timing_logs: bool = False,
+        enable_debug_logs: bool = False,
+        output_mime: str | None = None,
+        resample_res_type: str | None = None,
+        time_stretch_n_fft: int = 1024,
+        time_stretch_hop_length: int = 256,
+        tempo_ramp_chunks: int = TEMPO_RAMP_CHUNKS,
+    ) -> None:
+        super().__init__(
+            enable_timing_logs=enable_timing_logs,
+            enable_debug_logs=enable_debug_logs,
+            output_mime=output_mime,
+            resample_res_type=resample_res_type,
+            time_stretch_n_fft=time_stretch_n_fft,
+            time_stretch_hop_length=time_stretch_hop_length,
+        )
+        self.tempo_ramp_chunks = max(2, int(tempo_ramp_chunks))
+
+    def _build_transition_plan(
+        self, ordered_tracks: list[TrackInput], features: dict[uuid.UUID, _TrackFeatures]
+    ) -> list[_TransitionPlan]:
+        plans: list[_TransitionPlan] = []
+        for i in range(len(ordered_tracks) - 1):
+            a = ordered_tracks[i]
+            b = ordered_tracks[i + 1]
+            option = self._best_transition_option(features[a.mix_item_id], features[b.mix_item_id])
+
+            out_sec = features[a.mix_item_id].switch_out
+            beats_per_bar = out_sec.beats_per_bar if out_sec is not None else 4
+            bpm = option.target_bpm if option.target_bpm > 0 else 120.0
+            bar_s = (60.0 / bpm) * beats_per_bar
+
+            overlap_bars = 8
+            if option.delta_bpm_pct > 4.0 or option.key_clash or option.signature_penalty > 0.55:
+                overlap_bars = 4
+            elif option.delta_bpm_pct < 1.5 and option.signature_penalty < 0.25 and not option.key_clash:
+                overlap_bars = 12
+
+            overlap_s = max(self.MIN_OVERLAP_S, min(self.MAX_OVERLAP_S, bar_s * overlap_bars))
+            plans.append(
+                _TransitionPlan(
+                    from_id=a.mix_item_id,
+                    to_id=b.mix_item_id,
+                    option=option,
+                    overlap_bars=overlap_bars,
+                    overlap_s=overlap_s,
+                )
+            )
+        return plans
+
+    def _best_transition_option(
+        self, a: _TrackFeatures, b: _TrackFeatures, *, target_bpm: float | None = None
+    ) -> _TransitionOption:
+        _ = target_bpm
+        a_out = a.switch_out
+        b_in = b.switch_in
+        if a_out is None or b_in is None or a_out.bpm_local is None:
+            fallback_bpm_a = a_out.bpm_local if a_out and a_out.bpm_local else 120.0
+            fallback_bpm_b = b_in.bpm_local if b_in and b_in.bpm_local else fallback_bpm_a
+            delta_raw = abs(fallback_bpm_b - fallback_bpm_a) / max(fallback_bpm_a, 1e-9) * 100.0
+            start_raw, start_clamped, start_err, _, _, end_err = self._rate_metrics(
+                bpm_a=fallback_bpm_a, bpm_b=fallback_bpm_b
+            )
+            return _TransitionOption(
+                incoming_bpm=fallback_bpm_b,
+                target_bpm=fallback_bpm_a,
+                delta_bpm_pct=delta_raw,
+                stretch_rate=start_clamped,
+                key_penalty=0.5,
+                signature_penalty=0.5,
+                instability_penalty=1.0,
+                secondary_cost=2.0,
+                total_cost=9999.0 + start_err + end_err + abs(start_raw - start_clamped),
+                key_clash=False,
+            )
+
+        bpm_a = float(a_out.bpm_local)
+        incoming = list(b_in.bpm_candidates)
+        if b_in.bpm_local is not None:
+            incoming.append(float(b_in.bpm_local))
+        incoming = sorted({round(v, 6) for v in incoming if v > 0})
+        if not incoming:
+            incoming = [bpm_a]
+
+        options: list[_TransitionOption] = []
+        for bpm_b in incoming:
+            delta_raw_pct = abs(bpm_b - bpm_a) / max(bpm_a, 1e-9) * 100.0
+            start_raw, start_rate, start_err, end_raw, _, end_err = self._rate_metrics(bpm_a=bpm_a, bpm_b=bpm_b)
+            infeasible = (
+                start_raw < self.MIN_STRETCH_RATE
+                or start_raw > self.MAX_STRETCH_RATE
+                or end_raw < self.MIN_STRETCH_RATE
+                or end_raw > self.MAX_STRETCH_RATE
+            )
+
+            tempo_cost = delta_raw_pct + (start_err + end_err) * 40.0
+            if infeasible:
+                tempo_cost += self.HARD_TEMPO_MISMATCH_PENALTY
+
+            key_pen = self._key_penalty(a_out.key, b_in.key)
+            key_weight = min(max(a_out.key.confidence, 0.0), max(b_in.key.confidence, 0.0))
+            key_pen_w = key_pen * key_weight
+            sig_pen = self._signature_penalty(a_out, b_in)
+            instab = min(1.0, a_out.phase_var + b_in.phase_var)
+            sec = 0.8 * key_pen_w + 1.0 * sig_pen + 0.4 * instab
+            total = tempo_cost * 100.0 + sec * 10.0
+
+            options.append(
+                _TransitionOption(
+                    incoming_bpm=bpm_b,
+                    target_bpm=bpm_a,
+                    delta_bpm_pct=delta_raw_pct,
+                    stretch_rate=start_rate,
+                    key_penalty=key_pen_w,
+                    signature_penalty=sig_pen,
+                    instability_penalty=instab,
+                    secondary_cost=sec,
+                    total_cost=total,
+                    key_clash=(key_pen_w >= 0.55),
+                )
+            )
+
+        options.sort(
+            key=lambda o: (
+                o.total_cost,
+                o.delta_bpm_pct,
+                o.secondary_cost,
+                o.incoming_bpm,
+                str(b.track.mix_item_id),
+            )
+        )
+        return options[0]
+
+    def _render_with_plan(
+        self,
+        ordered_tracks: list[TrackInput],
+        features: dict[uuid.UUID, _TrackFeatures],
+        plans: list[_TransitionPlan],
+    ) -> tuple[np.ndarray, list[SegmentSpec]]:
+        first = ordered_tracks[0]
+        first_source_start_s = 0.0
+        first_audio = self._load_audio_stereo(first.abs_path)
+        chunks: list[np.ndarray] = [self._sanitize_stereo(first_audio)]
+        total_len_n = int(len(chunks[0]))
+
+        first_meta = first.metadata_json or {}
+        segments: list[SegmentSpec] = [
+            SegmentSpec(
+                position=0,
+                mix_item_id=first.mix_item_id,
+                start_ms=0,
+                end_ms=int(round((total_len_n / self.RENDER_SR) * 1000)),
+                source_start_ms=int(round(first_source_start_s * 1000)),
+                song_name=str(first_meta.get("song_name", "")),
+                artist_name=str(first_meta.get("artist_name", "")),
+            )
+        ]
+        placed = _PlacedTrack(track=first, source_start_s=first_source_start_s, stretch_rate=1.0, mix_start_s=0.0)
+
+        for i, plan in enumerate(plans):
+            incoming_track = ordered_tracks[i + 1]
+            incoming_feat = features[incoming_track.mix_item_id]
+            outgoing_feat = features[placed.track.mix_item_id]
+
+            region = self._track_region(incoming_feat)
+            region_start_s = region[0] if region is not None else 0.0
+            region_end_s = region[1] if region is not None else None
+
+            source_start_s = max(region_start_s, self._incoming_source_start(incoming_feat))
+            incoming = (
+                self._load_audio_stereo_region(incoming_track.abs_path, start_s=source_start_s, end_s=region_end_s)
+                if region_end_s is not None
+                else self._load_audio_stereo(incoming_track.abs_path)
+            )
+            incoming = self._sanitize_stereo(incoming)
+            if incoming.size == 0:
+                source_start_s = 0.0
+                incoming = self._sanitize_stereo(self._load_audio_stereo(incoming_track.abs_path))
+
+            out_chunk = self._sanitize_stereo(chunks[-1])
+            chunks[-1] = out_chunk
+            prefix_len_n = total_len_n - int(len(out_chunk))
+            out_start_n = prefix_len_n
+
+            overlap_n = int(round(plan.overlap_s * self.RENDER_SR))
+            overlap_n = int(np.clip(overlap_n, 1, max(1, len(out_chunk) - 1)))
+
+            out_fallback = outgoing_feat.switch_out.bpm_local if outgoing_feat.switch_out else None
+            in_fallback = incoming_feat.switch_in.bpm_local if incoming_feat.switch_in else None
+            bpm_a = (
+                float(plan.option.target_bpm)
+                if plan.option.target_bpm > 0
+                else float(out_fallback)
+                if out_fallback is not None and out_fallback > 0
+                else 120.0
+            )
+            bpm_b = (
+                float(plan.option.incoming_bpm)
+                if plan.option.incoming_bpm > 0
+                else float(in_fallback)
+                if in_fallback is not None and in_fallback > 0
+                else bpm_a
+            )
+
+            transition_start_n = out_start_n
+            start_in_chunk = 0
+            out_needed_n = 1
+            for _ in range(6):
+                overlap_n = int(np.clip(overlap_n, 1, max(1, len(out_chunk) - 1)))
+                out_needed_n = self._estimate_source_samples(
+                    bpm_native=bpm_a,
+                    bpm_start=bpm_a,
+                    bpm_end=bpm_b,
+                    output_n=overlap_n,
+                )
+                max_start_n = total_len_n - max(1, out_needed_n)
+                if max_start_n < out_start_n:
+                    if overlap_n <= 1:
+                        break
+                    ratio = max(0.5, (len(out_chunk) - 1) / max(1, out_needed_n))
+                    overlap_n = max(1, int(math.floor(overlap_n * ratio)))
+                    continue
+
+                default_start_n = max(out_start_n, total_len_n - overlap_n)
+                picked = self._pick_outgoing_transition_start(
+                    default_transition_start_n=default_start_n,
+                    mix_len_n=total_len_n,
+                    overlap_n=overlap_n,
+                    outgoing_feat=outgoing_feat,
+                    placed=placed,
+                )
+                transition_start_n = int(np.clip(picked, out_start_n, max_start_n))
+                start_in_chunk = transition_start_n - out_start_n
+                available = len(out_chunk) - start_in_chunk
+                if out_needed_n <= max(1, available):
+                    break
+                if overlap_n <= 1:
+                    break
+                ratio = max(0.5, max(1, available) / max(1, out_needed_n))
+                overlap_n = max(1, int(math.floor(overlap_n * ratio)))
+
+            start_in_chunk = int(np.clip(start_in_chunk, 0, max(0, len(out_chunk) - 1)))
+            out_source = out_chunk[start_in_chunk:]
+
+            out_ov_warped, _ = self._warp_overlap_piecewise(
+                source=out_source,
+                bpm_native=bpm_a,
+                bpm_start=bpm_a,
+                bpm_end=bpm_b,
+                output_n=overlap_n,
+            )
+            in_ov_warped, consumed_in_n = self._warp_overlap_piecewise(
+                source=incoming,
+                bpm_native=bpm_b,
+                bpm_start=bpm_a,
+                bpm_end=bpm_b,
+                output_n=overlap_n,
+            )
+            consumed_in_n = int(np.clip(consumed_in_n, 0, len(incoming)))
+
+            blend = self._equal_power_blend(out_ov_warped, self._apply_bass_swap(in_ov_warped))
+            new_out_chunk = np.vstack([out_chunk[:start_in_chunk], blend]).astype(np.float32)
+            chunks[-1] = new_out_chunk
+
+            tail = incoming[consumed_in_n:]
+            if tail.size:
+                chunks.append(tail.astype(np.float32))
+
+            total_len_n = prefix_len_n + int(len(new_out_chunk)) + int(len(tail))
+
+            prev = segments[-1]
+            segments[-1] = SegmentSpec(
+                position=prev.position,
+                mix_item_id=prev.mix_item_id,
+                start_ms=prev.start_ms,
+                end_ms=int(round(((transition_start_n + overlap_n) / self.RENDER_SR) * 1000)),
+                source_start_ms=prev.source_start_ms,
+                song_name=prev.song_name,
+                artist_name=prev.artist_name,
+            )
+
+            meta = incoming_track.metadata_json or {}
+            segments.append(
+                SegmentSpec(
+                    position=i + 1,
+                    mix_item_id=incoming_track.mix_item_id,
+                    start_ms=int(round((transition_start_n / self.RENDER_SR) * 1000)),
+                    end_ms=int(round((total_len_n / self.RENDER_SR) * 1000)),
+                    source_start_ms=int(round(source_start_s * 1000)),
+                    song_name=str(meta.get("song_name", "")),
+                    artist_name=str(meta.get("artist_name", "")),
+                )
+            )
+
+            source_shift_s = (consumed_in_n - overlap_n) / self.RENDER_SR
+            placed = _PlacedTrack(
+                track=incoming_track,
+                source_start_s=source_start_s + source_shift_s,
+                stretch_rate=1.0,
+                mix_start_s=transition_start_n / self.RENDER_SR,
+            )
+
+        if segments:
+            last = segments[-1]
+            segments[-1] = SegmentSpec(
+                position=last.position,
+                mix_item_id=last.mix_item_id,
+                start_ms=last.start_ms,
+                end_ms=int(round((total_len_n / self.RENDER_SR) * 1000)),
+                source_start_ms=last.source_start_ms,
+                song_name=last.song_name,
+                artist_name=last.artist_name,
+            )
+        mix_audio = np.vstack(chunks) if len(chunks) > 1 else chunks[0]
+        return mix_audio.astype(np.float32), segments
+
+    def _plan_debug_payload(self, plans: list[_TransitionPlan]) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for p in plans:
+            bpm_a = float(p.option.target_bpm) if p.option.target_bpm > 0 else 120.0
+            bpm_b = float(p.option.incoming_bpm) if p.option.incoming_bpm > 0 else bpm_a
+            start_raw, start_rate, start_err, end_raw, end_rate, end_err = self._rate_metrics(
+                bpm_a=bpm_a, bpm_b=bpm_b
+            )
+            payload.append(
+                {
+                    "from_id": str(p.from_id),
+                    "to_id": str(p.to_id),
+                    "bpm_a": bpm_a,
+                    "bpm_b": bpm_b,
+                    "delta_raw_bpm_pct": float(p.option.delta_bpm_pct),
+                    "start_rate_raw": float(start_raw),
+                    "start_rate_clamped": float(start_rate),
+                    "start_match_error_pct": float(start_err),
+                    "end_rate_raw": float(end_raw),
+                    "end_rate_clamped": float(end_rate),
+                    "end_match_error_pct": float(end_err),
+                    "secondary_cost": float(p.option.secondary_cost),
+                    "total_cost": float(p.option.total_cost),
+                    "overlap_bars": int(p.overlap_bars),
+                    "overlap_s": float(p.overlap_s),
+                    "tempo_ramp_chunks": int(self.tempo_ramp_chunks),
+                }
+            )
+        return payload
+
+    def _rate_metrics(self, *, bpm_a: float, bpm_b: float) -> tuple[float, float, float, float, float, float]:
+        safe_a = max(float(bpm_a), 1e-9)
+        safe_b = max(float(bpm_b), 1e-9)
+        start_raw = safe_a / safe_b
+        end_raw = safe_b / safe_a
+        start_clamped = float(np.clip(start_raw, self.MIN_STRETCH_RATE, self.MAX_STRETCH_RATE))
+        end_clamped = float(np.clip(end_raw, self.MIN_STRETCH_RATE, self.MAX_STRETCH_RATE))
+        start_eff_bpm = safe_b * start_clamped
+        end_eff_bpm = safe_a * end_clamped
+        start_err_pct = abs(start_eff_bpm - safe_a) / safe_a * 100.0
+        end_err_pct = abs(end_eff_bpm - safe_b) / safe_b * 100.0
+        return start_raw, start_clamped, start_err_pct, end_raw, end_clamped, end_err_pct
+
+    def _warp_overlap_piecewise(
+        self,
+        *,
+        source: np.ndarray,
+        bpm_native: float,
+        bpm_start: float,
+        bpm_end: float,
+        output_n: int,
+    ) -> tuple[np.ndarray, int]:
+        output_n = int(max(0, output_n))
+        if output_n <= 0:
+            return np.zeros((0, 2), dtype=np.float32), 0
+
+        src = self._sanitize_stereo(source)
+        chunk_lengths = self._split_lengths(output_n, self.tempo_ramp_chunks)
+        if not chunk_lengths:
+            return np.zeros((0, 2), dtype=np.float32), 0
+
+        rendered: list[np.ndarray] = []
+        consumed = 0
+        n_chunks = len(chunk_lengths)
+        for idx, out_len in enumerate(chunk_lengths):
+            frac = idx / (n_chunks - 1) if n_chunks > 1 else 1.0
+            bpm_target = bpm_start + (bpm_end - bpm_start) * frac
+            raw_rate = bpm_target / max(float(bpm_native), 1e-9)
+            rate = float(np.clip(raw_rate, self.MIN_STRETCH_RATE, self.MAX_STRETCH_RATE))
+            src_len = max(1, int(round(out_len * rate)))
+
+            raw_chunk = src[consumed : consumed + src_len]
+            if len(raw_chunk) < src_len:
+                pad_n = src_len - len(raw_chunk)
+                raw_chunk = np.vstack([raw_chunk, np.zeros((pad_n, 2), dtype=np.float32)])
+
+            rendered_chunk = self._stretch_to_length(raw_chunk, rate=rate, target_n=out_len)
+            rendered.append(rendered_chunk)
+            consumed += src_len
+
+        warped = np.vstack(rendered) if len(rendered) > 1 else rendered[0]
+        warped = self._fit_length(warped, output_n)
+        consumed_clamped = int(np.clip(consumed, 0, len(src)))
+        return warped, consumed_clamped
+
+    def _estimate_source_samples(self, *, bpm_native: float, bpm_start: float, bpm_end: float, output_n: int) -> int:
+        output_n = int(max(0, output_n))
+        if output_n <= 0:
+            return 0
+        chunk_lengths = self._split_lengths(output_n, self.tempo_ramp_chunks)
+        n_chunks = len(chunk_lengths)
+        total = 0
+        for idx, out_len in enumerate(chunk_lengths):
+            frac = idx / (n_chunks - 1) if n_chunks > 1 else 1.0
+            bpm_target = bpm_start + (bpm_end - bpm_start) * frac
+            raw_rate = bpm_target / max(float(bpm_native), 1e-9)
+            rate = float(np.clip(raw_rate, self.MIN_STRETCH_RATE, self.MAX_STRETCH_RATE))
+            total += max(1, int(round(out_len * rate)))
+        return int(max(1, total))
+
+    def _split_lengths(self, total: int, parts: int) -> list[int]:
+        total = int(max(0, total))
+        parts = int(max(1, parts))
+        if total <= 0:
+            return []
+        base = total // parts
+        rem = total % parts
+        lengths = [base + (1 if i < rem else 0) for i in range(parts)]
+        return [x for x in lengths if x > 0]
+
+    def _stretch_to_length(self, audio: np.ndarray, *, rate: float, target_n: int) -> np.ndarray:
+        src = self._sanitize_stereo(audio)
+        if target_n <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if len(src) == 0:
+            return np.zeros((target_n, 2), dtype=np.float32)
+        if abs(rate - 1.0) <= 1e-5 and len(src) == target_n:
+            return src
+        min_for_phase = max(32, int(self.time_stretch_n_fft // 2))
+        if len(src) < min_for_phase:
+            return self._resample_to_length(src, target_n)
+        try:
+            stretched = self._time_stretch_stereo(src, rate)
+        except Exception:
+            return self._resample_to_length(src, target_n)
+        if stretched.size == 0:
+            return self._resample_to_length(src, target_n)
+        return self._fit_length(stretched, target_n)
+
+    def _fit_length(self, audio: np.ndarray, target_n: int) -> np.ndarray:
+        y = self._sanitize_stereo(audio)
+        target_n = int(max(0, target_n))
+        if target_n <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if len(y) == target_n:
+            return y
+        if len(y) > target_n:
+            return y[:target_n]
+        pad = np.zeros((target_n - len(y), 2), dtype=np.float32)
+        return np.vstack([y, pad]).astype(np.float32)
+
+    def _resample_to_length(self, audio: np.ndarray, target_n: int) -> np.ndarray:
+        y = self._sanitize_stereo(audio)
+        target_n = int(max(0, target_n))
+        if target_n <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if len(y) <= 1:
+            return np.zeros((target_n, 2), dtype=np.float32)
+        if len(y) == target_n:
+            return y
+        src_x = np.linspace(0.0, float(len(y) - 1), num=len(y), dtype=np.float64)
+        dst_x = np.linspace(0.0, float(len(y) - 1), num=target_n, dtype=np.float64)
+        left = np.interp(dst_x, src_x, y[:, 0].astype(np.float64))
+        right = np.interp(dst_x, src_x, y[:, 1].astype(np.float64))
+        return np.column_stack([left, right]).astype(np.float32)
+
+    def _sanitize_stereo(self, audio: np.ndarray) -> np.ndarray:
+        y = np.asarray(audio, dtype=np.float32)
+        if y.ndim != 2:
+            return np.zeros((0, 2), dtype=np.float32)
+        if y.shape[1] == 1:
+            y = np.repeat(y, 2, axis=1)
+        elif y.shape[1] > 2:
+            y = y[:, :2]
+        return y.astype(np.float32)
+
+
 class PlaceholderMixRenderer:
     """
     Placeholder renderer:

@@ -13,7 +13,12 @@ from typing import Any
 import uuid
 
 from atomix.analyzers.mix_analyzer import MixAnalyzer, MixAnalyzerGlobalHPSS
-from atomix.renderers.mix_renderer import DeterministicMixRenderer, RenderResult, TrackInput
+from atomix.renderers.mix_renderer import (
+    DeterministicMixRenderer,
+    RenderResult,
+    TrackInput,
+    VariableBpmMixRenderer,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +34,12 @@ def parse_args() -> argparse.Namespace:
         default="local",
         choices=["local", "global_hpss"],
         help="Analyzer variant: local section HPSS or global full-track HPSS.",
+    )
+    parser.add_argument(
+        "--renderer",
+        default="deterministic",
+        choices=["deterministic", "variable_bpm"],
+        help="Renderer variant to use for audio rendering.",
     )
     parser.add_argument(
         "--analysis-sr",
@@ -137,14 +148,14 @@ def _mime_to_suffix(mime: str) -> str:
     return ".bin"
 
 
-def _resolve_output_audio_path(output_audio: str | None, variant: str, mime: str) -> Path:
+def _resolve_output_audio_path(output_audio: str | None, analyzer_variant: str, renderer_variant: str, mime: str) -> Path:
     suffix = _mime_to_suffix(mime)
     if output_audio:
         p = Path(output_audio).expanduser().resolve()
         if not p.suffix:
             p = p.with_suffix(suffix)
         return p
-    return Path("mix_pipeline_outputs").resolve() / f"rendered_mix_{variant}{suffix}"
+    return Path("mix_pipeline_outputs").resolve() / f"rendered_mix_{analyzer_variant}_{renderer_variant}{suffix}"
 
 
 def _resolve_output_segments_path(output_segments_json: str | None, output_audio_path: Path) -> Path:
@@ -168,6 +179,7 @@ async def _run_pipeline(
     metadata: list[dict[str, Any]],
     *,
     analyzer_variant: str,
+    renderer_variant: str,
     analysis_sr: int,
     hop_length: int,
     fixed_prefix_count: int,
@@ -181,10 +193,16 @@ async def _run_pipeline(
         hop_length=hop_length,
         enable_timing_logs=enable_timing_logs,
     )
-    renderer = DeterministicMixRenderer(
-        enable_timing_logs=enable_timing_logs,
-        enable_debug_logs=enable_renderer_debug_logs,
-    )
+    if renderer_variant == "variable_bpm":
+        renderer = VariableBpmMixRenderer(
+            enable_timing_logs=enable_timing_logs,
+            enable_debug_logs=enable_renderer_debug_logs,
+        )
+    else:
+        renderer = DeterministicMixRenderer(
+            enable_timing_logs=enable_timing_logs,
+            enable_debug_logs=enable_renderer_debug_logs,
+        )
 
     analysis_output_dir.mkdir(parents=True, exist_ok=True)
     track_inputs: list[TrackInput] = []
@@ -238,6 +256,7 @@ def main() -> int:
             track_paths,
             metadata,
             analyzer_variant=str(args.analyzer_variant),
+            renderer_variant=str(args.renderer),
             analysis_sr=int(args.analysis_sr),
             hop_length=int(args.hop_length),
             fixed_prefix_count=int(args.fixed_prefix_count),
@@ -249,7 +268,8 @@ def main() -> int:
 
     output_audio_path = _resolve_output_audio_path(
         output_audio=args.output_audio,
-        variant=str(args.analyzer_variant),
+        analyzer_variant=str(args.analyzer_variant),
+        renderer_variant=str(args.renderer),
         mime=render_result.mime,
     )
     output_segments_path = _resolve_output_segments_path(args.output_segments_json, output_audio_path)
@@ -272,6 +292,7 @@ def main() -> int:
 
     summary = {
         "analyzer_variant": str(args.analyzer_variant),
+        "renderer_variant": str(args.renderer),
         "analysis_sr": int(args.analysis_sr),
         "hop_length": int(args.hop_length),
         "input_directory": str(input_dir),

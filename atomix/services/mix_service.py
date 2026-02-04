@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from atomix.repos.audio_asset_repo import AudioAssetRepo
 from atomix.repos.mix_repo import MixRepo
 from atomix.services.storage_service import StorageService
-from atomix.renderers.mix_renderer import DeterministicMixRenderer, TrackInput
+from atomix.renderers.mix_renderer import DeterministicMixRenderer, VariableBpmMixRenderer, TrackInput
 from atomix.analyzers.mix_analyzer import MixAnalyzer
 from atomix.schemas.mix import MixStateOut, MixRevisionResponse, RevisionOut, SegmentOut
 from atomix.core.config import settings
@@ -44,7 +44,7 @@ class MixService:
         self.mixes = MixRepo(db)
 
         self.storage = StorageService()
-        self.renderer = DeterministicMixRenderer(enable_timing_logs=True, enable_debug_logs=True)
+        self.renderer = VariableBpmMixRenderer(enable_timing_logs=True, enable_debug_logs=True)
         self.analyzer = MixAnalyzer()
 
     async def create_mix(self, *, files: list[UploadFile], tracks_metadata: str) -> MixRevisionResponse:
