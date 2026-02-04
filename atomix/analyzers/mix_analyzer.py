@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -29,6 +31,9 @@ class MixAnalyzer:
     """
     Librosa-only analyzer that emphasizes section-local (switch-in/out) descriptors.
     """
+    USE_GLOBAL_HPSS = False
+    PREFER_LOCAL_BEATS = True
+    VARIANT_NAME = "local_hpss_sections"
 
     def __init__(
         self,
@@ -38,12 +43,15 @@ class MixAnalyzer:
         phase_bins_per_bar: int = 96,
         tempogram_peaks: int = 5,
         energy_curve_points: int = 60,
+        enable_timing_logs: bool = False,
     ) -> None:
         self.analysis_sr = analysis_sr
         self.hop_length = hop_length
         self.phase_bins_per_bar = phase_bins_per_bar
         self.tempogram_peaks = tempogram_peaks
         self.energy_curve_points = energy_curve_points
+        self.enable_timing_logs = enable_timing_logs
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
     async def analyze(self, abs_path: str, metadata_json: dict) -> AnalysisResult:
         """
@@ -59,6 +67,7 @@ class MixAnalyzer:
         return await asyncio.to_thread(self._analyze_sync, abs_path, metadata_json)
 
     def _analyze_sync(self, abs_path: str, metadata_json: dict) -> AnalysisResult:
+        total_start = time.perf_counter()
         debug: dict[str, Any] = {
             "params": {
                 "analysis_sr": self.analysis_sr,
@@ -66,44 +75,71 @@ class MixAnalyzer:
                 "phase_bins_per_bar": self.phase_bins_per_bar,
                 "tempogram_peaks": self.tempogram_peaks,
                 "energy_curve_points": self.energy_curve_points,
+                "enable_timing_logs": self.enable_timing_logs,
+                "variant_name": self.VARIANT_NAME,
+                "use_global_hpss": self.USE_GLOBAL_HPSS,
+                "beat_selection_mode": "prefer_local" if self.PREFER_LOCAL_BEATS else "cv_compare",
             },
             "fallbacks": [],
             "decisions": {},
             "errors": [],
+            "timing_s": {},
         }
 
         if np is None or librosa is None:
             debug["errors"].append("audio_deps_missing")
+            self._record_timing(debug, "total", total_start)
             return AnalysisResult(metadata_json=metadata_json, analysis_json=self._empty_analysis(debug))
 
+        step_start = time.perf_counter()
         try:
-            y, sr = librosa.load(abs_path, sr=self.analysis_sr, mono=True)
+            y, sr = self._load_audio(abs_path, debug)
         except Exception as exc:  # pragma: no cover - dependent on file IO
             debug["errors"].append(f"audio_load_failed: {exc}")
+            self._record_timing(debug, "load_audio", step_start)
+            self._record_timing(debug, "total", total_start)
             return AnalysisResult(metadata_json=metadata_json, analysis_json=self._empty_analysis(debug))
+        self._record_timing(debug, "load_audio", step_start)
 
         sr = int(sr)
         duration_s = float(librosa.get_duration(y=y, sr=sr))
-        y_harm, y_perc = librosa.effects.hpss(y)
 
-        onset_env_full = librosa.onset.onset_strength(y=y_perc, sr=sr, hop_length=self.hop_length)
+        y_harm_full = None
+        y_perc_full = None
+        if self.USE_GLOBAL_HPSS:
+            step_start = time.perf_counter()
+            y_harm_full, y_perc_full = librosa.effects.hpss(y)
+            self._record_timing(debug, "hpss_global", step_start)
+
+        step_start = time.perf_counter()
+        onset_source = y_perc_full if y_perc_full is not None else y
+        onset_env_full = librosa.onset.onset_strength(y=onset_source, sr=sr, hop_length=self.hop_length)
         onset_times_full = librosa.frames_to_time(
             np.arange(len(onset_env_full)),
             sr=sr,
             hop_length=self.hop_length,
         )
+        self._record_timing(debug, "onset_full", step_start)
 
+        step_start = time.perf_counter()
         beats_s_full = self._beat_track_from_onset(onset_env_full, sr)
         global_bpm_guess, _ = self._tempo_from_beats(beats_s_full)
+        self._record_timing(debug, "beats_full", step_start)
 
+        step_start = time.perf_counter()
         rms_full, rms_times_full = self._rms_curve(y, sr)
-        flux_full, flux_times_full = self._spectral_flux(y_perc, sr)
-        chroma_flux_full, chroma_times_full = self._chroma_flux(y_harm, sr)
+        flux_source = y_perc_full if y_perc_full is not None else y
+        chroma_source = y_harm_full if y_harm_full is not None else y
+        flux_full, flux_times_full = self._spectral_flux(flux_source, sr)
+        chroma_flux_full, chroma_times_full = self._chroma_flux(chroma_source, sr)
+        self._record_timing(debug, "global_curves", step_start)
 
-        region_span = min(duration_s * 0.3, 60.0)
+        # Force switch search regions to the first/last 30 seconds.
+        region_span = 30.0
         intro_region = (0.0, min(duration_s, region_span))
         outro_region = (max(0.0, duration_s - region_span), duration_s)
 
+        step_start = time.perf_counter()
         switch_in_window = self._select_switch_window(
             label="switch_in",
             region=intro_region,
@@ -119,6 +155,9 @@ class MixAnalyzer:
             duration_s=duration_s,
             debug=debug,
         )
+        self._record_timing(debug, "select_switch_in_window", step_start)
+
+        step_start = time.perf_counter()
         switch_out_window = self._select_switch_window(
             label="switch_out",
             region=outro_region,
@@ -134,32 +173,39 @@ class MixAnalyzer:
             duration_s=duration_s,
             debug=debug,
         )
+        self._record_timing(debug, "select_switch_out_window", step_start)
 
+        step_start = time.perf_counter()
         switch_in = self._analyze_section(
             label="switch_in",
             start_s=switch_in_window["start_s"],
             end_s=switch_in_window["end_s"],
             y=y,
-            y_harm=y_harm,
-            y_perc=y_perc,
+            y_harm_full=y_harm_full,
+            y_perc_full=y_perc_full,
             sr=sr,
             beats_s_full=beats_s_full,
             quality=switch_in_window["quality"],
             debug=debug,
         )
+        self._record_timing(debug, "analyze_switch_in", step_start)
+
+        step_start = time.perf_counter()
         switch_out = self._analyze_section(
             label="switch_out",
             start_s=switch_out_window["start_s"],
             end_s=switch_out_window["end_s"],
             y=y,
-            y_harm=y_harm,
-            y_perc=y_perc,
+            y_harm_full=y_harm_full,
+            y_perc_full=y_perc_full,
             sr=sr,
             beats_s_full=beats_s_full,
             quality=switch_out_window["quality"],
             debug=debug,
         )
+        self._record_timing(debug, "analyze_switch_out", step_start)
 
+        step_start = time.perf_counter()
         analysis_json = {
             "schema_version": 2,
             "track": {
@@ -168,7 +214,6 @@ class MixAnalyzer:
                 "hop_length": int(self.hop_length),
                 "overview": {
                     "global_bpm_guess": global_bpm_guess,
-                    "rms_mean": float(np.mean(rms_full)) if rms_full.size else 0.0,
                 },
             },
             "sections": {
@@ -177,8 +222,39 @@ class MixAnalyzer:
             },
             "debug": debug,
         }
+        self._record_timing(debug, "assemble_output", step_start)
+        self._record_timing(debug, "total", total_start)
 
         return AnalysisResult(metadata_json=metadata_json, analysis_json=analysis_json)
+
+    def _load_audio(self, abs_path: str, debug: dict[str, Any]) -> tuple[Any, int]:
+        try:
+            return librosa.load(
+                abs_path,
+                sr=self.analysis_sr,
+                mono=True,
+                res_type="kaiser_fast",
+            )
+        except ModuleNotFoundError as exc:
+            # kaiser_fast depends on resampy in some librosa setups.
+            if "resampy" not in str(exc):
+                raise
+            debug["fallbacks"].append("audio_load_resampy_missing_fallback_soxr_hq")
+            if self.enable_timing_logs:
+                self.logger.warning("resampy missing; falling back to librosa.load res_type=soxr_hq")
+            return librosa.load(
+                abs_path,
+                sr=self.analysis_sr,
+                mono=True,
+                res_type="soxr_hq",
+            )
+
+    def _record_timing(self, debug: dict[str, Any], label: str, start: float) -> None:
+        elapsed = float(time.perf_counter() - start)
+        timing = debug.setdefault("timing_s", {})
+        timing[label] = elapsed
+        if self.enable_timing_logs:
+            self.logger.info("Timing %s: %.3fs", label, elapsed)
 
     def _beat_track_from_onset(self, onset_env: Any, sr: int) -> list[float]:
         if onset_env is None or len(onset_env) == 0:
@@ -345,15 +421,18 @@ class MixAnalyzer:
         start_s: float,
         end_s: float,
         y: Any,
-        y_harm: Any,
-        y_perc: Any,
+        y_harm_full: Any,
+        y_perc_full: Any,
         sr: int,
         beats_s_full: list[float],
         quality: dict[str, Any],
         debug: dict[str, Any],
     ) -> dict[str, Any]:
+        section_total_start = time.perf_counter()
+        timing_prefix = f"section.{label}"
         if end_s <= start_s:
             debug["fallbacks"].append(f"{label}_empty_window")
+            self._record_timing(debug, f"{timing_prefix}.total", section_total_start)
             return {
                 "start_s": float(start_s),
                 "end_s": float(end_s),
@@ -368,9 +447,17 @@ class MixAnalyzer:
         start_idx = int(start_s * sr)
         end_idx = int(end_s * sr)
         y_section = y[start_idx:end_idx]
-        y_harm_section = y_harm[start_idx:end_idx]
-        y_perc_section = y_perc[start_idx:end_idx]
 
+        step_start = time.perf_counter()
+        if self.USE_GLOBAL_HPSS and y_harm_full is not None and y_perc_full is not None:
+            y_harm_section = y_harm_full[start_idx:end_idx]
+            y_perc_section = y_perc_full[start_idx:end_idx]
+            self._record_timing(debug, f"{timing_prefix}.hpss_slice_global", step_start)
+        else:
+            y_harm_section, y_perc_section = librosa.effects.hpss(y_section)
+            self._record_timing(debug, f"{timing_prefix}.hpss_section", step_start)
+
+        step_start = time.perf_counter()
         onset_env_sec = librosa.onset.onset_strength(
             y=y_perc_section,
             sr=sr,
@@ -384,7 +471,9 @@ class MixAnalyzer:
             )
             + start_s
         )
+        self._record_timing(debug, f"{timing_prefix}.onset", step_start)
 
+        step_start = time.perf_counter()
         beats_local = self._beat_track_from_onset(onset_env_sec, sr)
         beats_local = [b + start_s for b in beats_local]
         beats_global = [b for b in beats_s_full if start_s <= b <= end_s]
@@ -392,20 +481,30 @@ class MixAnalyzer:
         beats_s, beat_source = self._choose_beats(beats_local, beats_global)
         if beat_source != "local":
             debug["fallbacks"].append(f"{label}_beats_from_{beat_source}")
+        self._record_timing(debug, f"{timing_prefix}.beats", step_start)
 
+        step_start = time.perf_counter()
         bpm_local, beat_stats = self._tempo_from_beats(beats_s)
         bpm_candidates = self._tempo_candidates(bpm_local)
+        self._record_timing(debug, f"{timing_prefix}.tempo_stats", step_start)
 
+        step_start = time.perf_counter()
         meter_info, signature, beat_positions, downbeats_s = self._infer_meter_and_signature(
             beats_s=beats_s,
             onset_env=onset_env_sec,
             onset_times=onset_times_sec,
         )
+        self._record_timing(debug, f"{timing_prefix}.meter_signature", step_start)
 
+        step_start = time.perf_counter()
         harmony = self._harmony_features(y=y_harm_section, sr=sr)
+        self._record_timing(debug, f"{timing_prefix}.harmony", step_start)
+        step_start = time.perf_counter()
         timbre = self._timbre_features(y=y_section, sr=sr)
+        self._record_timing(debug, f"{timing_prefix}.timbre", step_start)
+        step_start = time.perf_counter()
         spectral = self._spectral_features(y=y_section, sr=sr)
-        energy = self._energy_features(y=y_section, sr=sr)
+        self._record_timing(debug, f"{timing_prefix}.spectral", step_start)
 
         rhythm = {
             "beats_s": self._clean_floats(beats_s),
@@ -418,7 +517,7 @@ class MixAnalyzer:
             "signature": signature,
         }
 
-        return {
+        section_result = {
             "start_s": float(start_s),
             "end_s": float(end_s),
             "quality": quality,
@@ -426,8 +525,10 @@ class MixAnalyzer:
             "harmony": harmony,
             "timbre": timbre,
             "spectral": spectral,
-            "energy": energy,
+            "energy": {},
         }
+        self._record_timing(debug, f"{timing_prefix}.total", section_total_start)
+        return section_result
 
 
     def _empty_analysis(self, debug: dict[str, Any]) -> dict[str, Any]:
@@ -465,6 +566,14 @@ class MixAnalyzer:
         }
 
     def _choose_beats(self, beats_local: list[float], beats_global: list[float]) -> tuple[list[float], str]:
+        if self.PREFER_LOCAL_BEATS:
+            if len(beats_local) >= 3:
+                return beats_local, "local"
+            if len(beats_global) >= 3:
+                return beats_global, "global"
+            return beats_local if beats_local else beats_global, "insufficient"
+
+        # Previous behavior: choose source by interval stability (CV).
         if len(beats_local) < 3 and len(beats_global) < 3:
             return beats_local if beats_local else beats_global, "insufficient"
         cv_local = self._interval_cv(beats_local)
@@ -656,7 +765,11 @@ class MixAnalyzer:
             sr=self.analysis_sr,
             hop_length=self.hop_length,
         )
-        peaks = self._top_peaks(tempo_bins, tempogram_mean, self.tempogram_peaks)
+        # tempo_frequencies includes lag=0 as the first bin, which maps to inf BPM.
+        # Exclude that non-physical bin from peak picking.
+        peak_tempo_bins = tempo_bins[1:] if tempo_bins.shape[0] > 1 else np.array([])
+        peak_strength = tempogram_mean[1:] if tempogram_mean.shape[0] > 1 else np.array([])
+        peaks = self._top_peaks(peak_tempo_bins, peak_strength, self.tempogram_peaks)
         profile_ds = self._downsample_curve(tempogram_mean, n=40) if tempogram_mean.size else []
 
         if phase is None:
@@ -722,11 +835,37 @@ class MixAnalyzer:
     def _top_peaks(self, bpm: Any, strength: Any, k: int) -> list[dict[str, float]]:
         if strength is None or len(strength) == 0:
             return []
-        strength = np.asarray(strength)
-        indices = np.argsort(strength)[::-1]
+        bpm_arr = np.asarray(bpm, dtype=float).reshape(-1)
+        strength_arr = np.asarray(strength, dtype=float).reshape(-1)
+
+        n = min(bpm_arr.shape[0], strength_arr.shape[0])
+        if n == 0:
+            return []
+        bpm_arr = bpm_arr[:n]
+        strength_arr = strength_arr[:n]
+
+        valid = (
+            np.isfinite(bpm_arr)
+            & np.isfinite(strength_arr)
+            & (bpm_arr > 0.0)
+            & (strength_arr > 0.0)
+        )
+        if not np.any(valid):
+            return []
+
+        bpm_valid = bpm_arr[valid]
+        strength_valid = strength_arr[valid]
+
+        # Prefer musically plausible tempo peaks; fall back to all finite bins if needed.
+        plausible = (bpm_valid >= 30.0) & (bpm_valid <= 300.0)
+        if np.any(plausible):
+            bpm_valid = bpm_valid[plausible]
+            strength_valid = strength_valid[plausible]
+
+        indices = np.argsort(strength_valid)[::-1]
         peaks: list[dict[str, float]] = []
         for idx in indices[:k]:
-            peaks.append({"bpm": float(bpm[idx]), "strength": float(strength[idx])})
+            peaks.append({"bpm": float(bpm_valid[idx]), "strength": float(strength_valid[idx])})
         return peaks
 
     def _scale_beats(self, beats_s: list[float], tempo_scale: float) -> list[float]:
@@ -857,16 +996,6 @@ class MixAnalyzer:
             "bandwidth_std": float(np.std(bandwidth)),
             "rolloff_mean": float(np.mean(rolloff)),
             "rolloff_std": float(np.std(rolloff)),
-        }
-
-    def _energy_features(self, *, y: Any, sr: int) -> dict[str, Any]:
-        if len(y) == 0:
-            return {}
-        rms, _ = self._rms_curve(y, sr)
-        return {
-            "rms_mean": float(np.mean(rms)) if rms.size else 0.0,
-            "rms_std": float(np.std(rms)) if rms.size else 0.0,
-            "rms_curve": self._downsample_curve(rms, n=self.energy_curve_points),
         }
 
     def _rms_curve(self, y: Any, sr: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1017,3 +1146,13 @@ class PlaceholderMixAnalyzer:
             metadata_json=metadata_json,
             analysis_json=analysis,
         )
+
+
+class MixAnalyzerGlobalHPSS(MixAnalyzer):
+    """
+    Variant that performs full-track HPSS and uses CV-based local/global beat source selection.
+    """
+
+    USE_GLOBAL_HPSS = True
+    PREFER_LOCAL_BEATS = False
+    VARIANT_NAME = "global_hpss_cv_beats"

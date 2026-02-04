@@ -7,7 +7,6 @@ Field summary
 - track.hop_length: Hop length used for time-based features.
 - track.overview: Minimal global overview block.
 - track.overview.global_bpm_guess: Full-track BPM estimate from the global beat grid.
-- track.overview.rms_mean: Full-track RMS mean for coarse loudness context.
 - sections.switch_in.start_s: Start time of the switch-in window in seconds.
 - sections.switch_in.end_s: End time of the switch-in window in seconds.
 - sections.switch_in.quality.score: Window quality score used for selection.
@@ -58,9 +57,7 @@ Field summary
 - sections.switch_in.spectral.bandwidth_std: Spectral bandwidth std.
 - sections.switch_in.spectral.rolloff_mean: Mean spectral rolloff.
 - sections.switch_in.spectral.rolloff_std: Spectral rolloff std.
-- sections.switch_in.energy.rms_mean: Mean RMS energy.
-- sections.switch_in.energy.rms_std: RMS std.
-- sections.switch_in.energy.rms_curve: Downsampled RMS curve for the section.
+- sections.switch_in.energy: Reserved object for backward compatibility. Currently `{}`.
 - sections.switch_out.start_s: Start time of the switch-out window in seconds.
 - sections.switch_out.end_s: End time of the switch-out window in seconds.
 - sections.switch_out.quality.score: Window quality score used for selection.
@@ -111,14 +108,12 @@ Field summary
 - sections.switch_out.spectral.bandwidth_std: Spectral bandwidth std.
 - sections.switch_out.spectral.rolloff_mean: Mean spectral rolloff.
 - sections.switch_out.spectral.rolloff_std: Spectral rolloff std.
-- sections.switch_out.energy.rms_mean: Mean RMS energy.
-- sections.switch_out.energy.rms_std: RMS std.
-- sections.switch_out.energy.rms_curve: Downsampled RMS curve for the section.
+- sections.switch_out.energy: Reserved object for backward compatibility. Currently `{}`.
+- debug.params.energy_curve_points: Retained parameter for backward compatibility (not emitted as section energy).
 - debug.params.analysis_sr: Analysis sample rate used.
 - debug.params.hop_length: Hop length used.
 - debug.params.phase_bins_per_bar: Phase bins per bar configured.
 - debug.params.tempogram_peaks: Number of tempogram peaks stored.
-- debug.params.energy_curve_points: Downsample count for RMS curve.
 - debug.fallbacks: List of fallback decisions taken.
 - debug.decisions.switch_in.window_start_s: Selected switch-in window start.
 - debug.decisions.switch_in.window_end_s: Selected switch-in window end.
@@ -137,8 +132,7 @@ Example analysis_json
     "sr": 22050,
     "hop_length": 512,
     "overview": {
-      "global_bpm_guess": 128.4,
-      "rms_mean": 0.084
+      "global_bpm_guess": 128.4
     }
   },
   "sections": {
@@ -205,11 +199,7 @@ Example analysis_json
         "rolloff_mean": 4920.1,
         "rolloff_std": 620.8
       },
-      "energy": {
-        "rms_mean": 0.084,
-        "rms_std": 0.012,
-        "rms_curve": [0.072, 0.076, 0.083, 0.087, 0.091, 0.089, 0.085, 0.081]
-      }
+      "energy": {}
     },
     "switch_out": {
       "start_s": 176.4,
@@ -274,11 +264,7 @@ Example analysis_json
         "rolloff_mean": 4879.8,
         "rolloff_std": 603.4
       },
-      "energy": {
-        "rms_mean": 0.082,
-        "rms_std": 0.011,
-        "rms_curve": [0.074, 0.078, 0.083, 0.086, 0.088, 0.087, 0.084, 0.080]
-      }
+      "energy": {}
     }
   },
   "debug": {
@@ -300,7 +286,7 @@ Example analysis_json
 ```
 
 Notes on selection and signature
-- Switch windows are searched in intro/outro regions (first and last 30% or 60s), aligned to beats when possible.
+- Switch windows are searched in intro/outro regions (first 30s and last 30s), aligned to beats when possible.
 - Window scoring rewards stable tempo and clear percussive onsets and penalizes energy ramps, spectral flux, and chroma flux.
 - Rhythmic signature combines tempogram peaks with a bar-phase onset pattern derived from percussive onsets.
 - Phase patterns are aggregated across bars after testing tempo-scale hypotheses and beat offsets, then normalized for stability.

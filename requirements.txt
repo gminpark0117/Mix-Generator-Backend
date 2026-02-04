@@ -10,3 +10,4 @@ numpy==1.26.4
 scipy==1.11.4
 librosa==0.10.2.post1
 soundfile==0.12.1
+resampy==0.4.3
