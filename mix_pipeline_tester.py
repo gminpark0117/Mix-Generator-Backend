@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-audio",
         default=None,
-        help="Output mix audio path (default: ./mix_pipeline_outputs/rendered_mix_<variant>.mp3).",
+        help="Output mix audio path (default: ./mix_pipeline_outputs/rendered_mix_<variant>.wav).",
     )
     parser.add_argument(
         "--output-segments-json",

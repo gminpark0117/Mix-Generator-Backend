@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import importlib.util
 import logging
 import math
 import struct
@@ -131,14 +132,37 @@ class DeterministicMixRenderer:
     MIN_STRETCH_RATE = 0.94
     MAX_STRETCH_RATE = 1.06
     BASS_SWAP_HPF_HZ = 180.0
-    OUTPUT_MIME = "audio/mpeg"
+    # WAV is deterministic and fast to encode (use MP3 only when you explicitly need smaller files).
+    DEFAULT_OUTPUT_MIME = "audio/wav"
     TRIM_PAD_PRE_S = 0.25
     TRIM_PAD_POST_S = 0.75
     MIN_TRIMMED_WINDOW_S = 8.0
 
-    def __init__(self, *, enable_timing_logs: bool = False, enable_debug_logs: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        enable_timing_logs: bool = False,
+        enable_debug_logs: bool = False,
+        output_mime: str | None = None,
+        resample_res_type: str | None = None,
+        time_stretch_n_fft: int = 1024,
+        time_stretch_hop_length: int = 256,
+    ) -> None:
         self.enable_timing_logs = enable_timing_logs
         self.enable_debug_logs = enable_debug_logs
+        self.output_mime = output_mime or self.DEFAULT_OUTPUT_MIME
+
+        # Prefer SoXR (C-accelerated) when available; fallback to resampy (kaiser_fast).
+        if resample_res_type:
+            self.resample_res_type = str(resample_res_type)
+        else:
+            self.resample_res_type = (
+                "soxr_hq" if importlib.util.find_spec("soxr") is not None else "kaiser_fast"
+            )
+
+        # Librosa time-stretch defaults (2048/512) are noticeably slower for long audio; use smaller FFTs by default.
+        self.time_stretch_n_fft = max(256, int(time_stretch_n_fft))
+        self.time_stretch_hop_length = max(64, int(time_stretch_hop_length))
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
     async def render(self, tracks: list[TrackInput], fixed_tracks: list[TrackInput]) -> RenderResult:
@@ -165,14 +189,14 @@ class DeterministicMixRenderer:
         if not unique_tracks:
             silence = np.zeros((self.RENDER_SR, self.CHANNELS), dtype=np.float32)
             step_start = time.perf_counter()
-            audio_bytes = self._float_stereo_to_mp3_bytes(silence)
+            audio_bytes = self._encode_output_bytes(silence)
             self._record_timing(debug, "encode_output", step_start)
             debug["decisions"]["render_mode"] = "empty_input_silence"
             self._record_timing(debug, "total", total_start)
             self._emit_render_debug(debug)
             return RenderResult(
                 audio_bytes=audio_bytes,
-                mime=self.OUTPUT_MIME,
+                mime=self.output_mime,
                 length_ms=1000,
                 segments=[],
                 debug=debug,
@@ -221,7 +245,7 @@ class DeterministicMixRenderer:
             debug["decisions"]["simple_overlap_s"] = self.SIMPLE_OVERLAP_S
 
         step_start = time.perf_counter()
-        audio_bytes = self._float_stereo_to_mp3_bytes(mix_audio)
+        audio_bytes = self._encode_output_bytes(mix_audio)
         self._record_timing(debug, "encode_output", step_start)
         length_ms = int(round((len(mix_audio) / self.RENDER_SR) * 1000))
         debug["decisions"]["length_ms"] = length_ms
@@ -231,7 +255,7 @@ class DeterministicMixRenderer:
         self._emit_render_debug(debug)
         return RenderResult(
             audio_bytes=audio_bytes,
-            mime=self.OUTPUT_MIME,
+            mime=self.output_mime,
             length_ms=length_ms,
             segments=segments,
             debug=debug,
@@ -452,11 +476,35 @@ class DeterministicMixRenderer:
     def _build_transition_plan(
         self, ordered_tracks: list[TrackInput], features: dict[uuid.UUID, _TrackFeatures]
     ) -> list[_TransitionPlan]:
+        """
+        Build a sequential, tempo-consistent transition plan.
+
+        Important: the renderer currently time-stretches the *entire rendered chunk* of each incoming track.
+        That means a track's "effective BPM in the mix" is modified and persists until the next transition.
+
+        To avoid overlaps where the outgoing audio is at a different (already-stretched) tempo than the
+        incoming audio, we plan transitions against a running "mix BPM" that propagates forward.
+        """
         plans: list[_TransitionPlan] = []
+
+        if len(ordered_tracks) < 2:
+            return plans
+
+        first_feat = features.get(ordered_tracks[0].mix_item_id)
+        first_out = first_feat.switch_out if first_feat is not None else None
+        first_in = first_feat.switch_in if first_feat is not None else None
+        current_bpm = (
+            float(first_out.bpm_local)
+            if first_out is not None and first_out.bpm_local is not None and first_out.bpm_local > 0
+            else float(first_in.bpm_local)
+            if first_in is not None and first_in.bpm_local is not None and first_in.bpm_local > 0
+            else 120.0
+        )
+
         for i in range(len(ordered_tracks) - 1):
             a = ordered_tracks[i]
             b = ordered_tracks[i + 1]
-            option = self._best_transition_option(features[a.mix_item_id], features[b.mix_item_id])
+            option = self._best_transition_option(features[a.mix_item_id], features[b.mix_item_id], target_bpm=current_bpm)
 
             out_sec = features[a.mix_item_id].switch_out
             beats_per_bar = out_sec.beats_per_bar if out_sec is not None else 4
@@ -479,15 +527,39 @@ class DeterministicMixRenderer:
                     overlap_s=overlap_s,
                 )
             )
+
+            # Propagate the actually-achieved tempo to keep subsequent transitions coherent.
+            # (When clamped, option.target_bpm may not be fully achieved.)
+            achieved = float(option.incoming_bpm * option.stretch_rate) if option.incoming_bpm > 0 else float(bpm)
+            if math.isfinite(achieved) and achieved > 0:
+                current_bpm = achieved
         return plans
 
-    def _best_transition_option(self, a: _TrackFeatures, b: _TrackFeatures) -> _TransitionOption:
+    def _best_transition_option(
+        self, a: _TrackFeatures, b: _TrackFeatures, *, target_bpm: float | None = None
+    ) -> _TransitionOption:
         a_out = a.switch_out
         b_in = b.switch_in
-        if a_out is None or b_in is None or a_out.bpm_local is None:
+        if b_in is None:
             return _TransitionOption(
                 incoming_bpm=b_in.bpm_local if b_in and b_in.bpm_local else 120.0,
-                target_bpm=a_out.bpm_local if a_out and a_out.bpm_local else 120.0,
+                target_bpm=float(target_bpm) if target_bpm is not None else (a_out.bpm_local if a_out and a_out.bpm_local else 120.0),
+                delta_bpm_pct=99.0,
+                stretch_rate=1.0,
+                key_penalty=0.5,
+                signature_penalty=0.5,
+                instability_penalty=1.0,
+                secondary_cost=2.0,
+                total_cost=9999.0,
+                key_clash=False,
+            )
+        if a_out is None or a_out.bpm_local is None:
+            # Without an outgoing analysis section, we can still evaluate incoming candidates against
+            # a provided target mix tempo (if any); otherwise use the incoming local tempo.
+            fallback_target = float(target_bpm) if target_bpm is not None else (b_in.bpm_local if b_in.bpm_local else 120.0)
+            return _TransitionOption(
+                incoming_bpm=b_in.bpm_local if b_in.bpm_local else fallback_target,
+                target_bpm=fallback_target,
                 delta_bpm_pct=99.0,
                 stretch_rate=1.0,
                 key_penalty=0.5,
@@ -505,9 +577,10 @@ class DeterministicMixRenderer:
         if not incoming:
             incoming = [a_out.bpm_local]
 
+        target = float(target_bpm) if target_bpm is not None and target_bpm > 0 else float(a_out.bpm_local)
+
         options: list[_TransitionOption] = []
         for bpm_in in incoming:
-            target = a_out.bpm_local
             raw_rate = target / bpm_in if bpm_in > 0 else 1.0
             stretch = float(np.clip(raw_rate, self.MIN_STRETCH_RATE, self.MAX_STRETCH_RATE))
             effective = bpm_in * stretch
@@ -598,7 +671,8 @@ class DeterministicMixRenderer:
         track: TrackInput,
         feat: _TrackFeatures | None = None,
     ) -> tuple[np.ndarray, list[SegmentSpec]]:
-        region = self._track_region(feat) if feat is not None else None
+        # First/only track must begin at source start for predictable playback.
+        region = None
         source_start_s = 0.0
         source_end_s: float | None = None
         if region is not None:
@@ -629,10 +703,9 @@ class DeterministicMixRenderer:
         plans: list[_TransitionPlan],
     ) -> tuple[np.ndarray, list[SegmentSpec]]:
         first = ordered_tracks[0]
-        first_feat = features.get(first.mix_item_id)
-        first_region = self._track_region(first_feat)
-        first_source_start_s = first_region[0] if first_region is not None else 0.0
-        first_source_end_s = first_region[1] if first_region is not None else None
+        # Keep first track anchored to source start (not switch-in).
+        first_source_start_s = 0.0
+        first_source_end_s: float | None = None
         first_audio = (
             self._load_audio_stereo_region(first.abs_path, start_s=first_source_start_s, end_s=first_source_end_s)
             if first_source_end_s is not None
@@ -932,12 +1005,7 @@ class DeterministicMixRenderer:
         if sr == self.RENDER_SR:
             return y.astype(np.float32)
 
-        ch0 = self._resample_1d(y[:, 0], sr, self.RENDER_SR)
-        ch1 = self._resample_1d(y[:, 1], sr, self.RENDER_SR)
-        n = min(len(ch0), len(ch1))
-        if n <= 0:
-            return np.zeros((0, 2), dtype=np.float32)
-        return np.column_stack([ch0[:n], ch1[:n]]).astype(np.float32)
+        return self._resample_stereo(y, orig_sr=sr, target_sr=self.RENDER_SR)
 
     def _load_audio_stereo_region(self, abs_path: str, *, start_s: float, end_s: float | None) -> np.ndarray:
         """
@@ -986,21 +1054,71 @@ class DeterministicMixRenderer:
         if sr == self.RENDER_SR:
             return y.astype(np.float32)
 
-        ch0 = self._resample_1d(y[:, 0], sr, self.RENDER_SR)
-        ch1 = self._resample_1d(y[:, 1], sr, self.RENDER_SR)
-        n = min(len(ch0), len(ch1))
-        if n <= 0:
-            return np.zeros((0, 2), dtype=np.float32)
-        return np.column_stack([ch0[:n], ch1[:n]]).astype(np.float32)
+        return self._resample_stereo(y, orig_sr=sr, target_sr=self.RENDER_SR)
 
-    def _resample_1d(self, x: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        try:
-            y = librosa.resample(x, orig_sr=orig_sr, target_sr=target_sr, res_type="kaiser_fast")
-        except ModuleNotFoundError as exc:
-            if "resampy" not in str(exc):
+    def _resample_stereo(self, y: np.ndarray, *, orig_sr: int, target_sr: int) -> np.ndarray:
+        y = np.asarray(y, dtype=np.float32)
+        if y.ndim != 2 or y.size == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if y.shape[1] == 1:
+            y = np.repeat(y, 2, axis=1)
+        elif y.shape[1] > 2:
+            y = y[:, :2]
+        if orig_sr == target_sr:
+            return y.astype(np.float32)
+
+        # Resample both channels in one call to reduce overhead and keep channels aligned.
+        y_cf = y.T  # (2, n)
+        y_rs = self._resample_audio(y_cf, orig_sr=orig_sr, target_sr=target_sr)
+        y_rs = self._ensure_float_array(y_rs)
+        if y_rs.ndim != 2 or y_rs.shape[0] < 2:
+            return np.zeros((0, 2), dtype=np.float32)
+        return y_rs[:2, :].T.astype(np.float32)
+
+    def _resample_audio(self, y: np.ndarray, *, orig_sr: int, target_sr: int) -> np.ndarray:
+        if orig_sr == target_sr:
+            return self._ensure_float_array(y)
+
+        res_types: list[str] = []
+        preferred = str(self.resample_res_type or "").strip()
+        if preferred:
+            res_types.append(preferred)
+        # Always include a sane fallback order.
+        if "soxr_hq" not in res_types:
+            res_types.append("soxr_hq")
+        if "kaiser_fast" not in res_types:
+            res_types.append("kaiser_fast")
+
+        last_exc: Exception | None = None
+        for res_type in res_types:
+            try:
+                out = librosa.resample(y, orig_sr=orig_sr, target_sr=target_sr, res_type=res_type)
+                return self._ensure_float_array(out)
+            except ModuleNotFoundError as exc:
+                last_exc = exc
+                msg = str(exc)
+                if res_type.startswith("soxr_") and "soxr" in msg:
+                    continue
+                if res_type.startswith("kaiser") and "resampy" in msg:
+                    continue
                 raise
-            y = librosa.resample(x, orig_sr=orig_sr, target_sr=target_sr, res_type="soxr_hq")
-        return self._ensure_float_array(y)
+
+        # Last resort: polyphase resampling (deterministic).
+        try:
+            from scipy.signal import resample_poly  # type: ignore
+
+            g = math.gcd(int(orig_sr), int(target_sr))
+            up = int(target_sr) // g
+            down = int(orig_sr) // g
+            y_arr = np.asarray(y, dtype=np.float32)
+            if y_arr.ndim == 1:
+                return self._ensure_float_array(resample_poly(y_arr, up, down))
+            rows = [self._ensure_float_array(resample_poly(row, up, down)) for row in y_arr]
+            return np.stack(rows, axis=0).astype(np.float32)
+        except Exception:
+            if last_exc is not None:
+                raise last_exc
+            raise
 
     def _time_stretch_stereo(self, audio: np.ndarray, rate: float) -> np.ndarray:
         if audio.size == 0 or abs(rate - 1.0) <= 1e-5:
@@ -1009,7 +1127,12 @@ class DeterministicMixRenderer:
         y = np.asarray(audio, dtype=np.float32)
         if y.ndim != 2 or y.shape[1] != 2:
             y = self._ensure_float_array(y).reshape((-1, 2)) if y.size else np.zeros((0, 2), dtype=np.float32)
-        yt_raw = librosa.effects.time_stretch(y.T, rate=rate)
+        yt_raw = librosa.effects.time_stretch(
+            y.T,
+            rate=rate,
+            n_fft=int(self.time_stretch_n_fft),
+            hop_length=int(self.time_stretch_hop_length),
+        )
         yt = self._ensure_float_array(yt_raw)
         if yt.ndim != 2:
             return np.zeros((0, 2), dtype=np.float32)
@@ -1017,6 +1140,15 @@ class DeterministicMixRenderer:
             yt = np.vstack([yt, yt])
         out = yt[:2, :].T
         return out.astype(np.float32)
+
+    def _encode_output_bytes(self, audio: np.ndarray) -> bytes:
+        mime = str(self.output_mime or self.DEFAULT_OUTPUT_MIME).lower().strip()
+        if mime in ("audio/wav", "audio/wave", "audio/x-wav"):
+            return self._float_stereo_to_wav_bytes(audio)
+        if mime in ("audio/mpeg", "audio/mp3"):
+            return self._float_stereo_to_mp3_bytes(audio)
+        # Deterministic default.
+        return self._float_stereo_to_wav_bytes(audio)
 
     def _float_stereo_to_wav_bytes(self, audio: np.ndarray) -> bytes:
         audio = np.asarray(audio, dtype=np.float32)

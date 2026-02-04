@@ -1,67 +1,72 @@
-TASK: Implement deterministic MixRenderer (ordering + bar-aligned beatmatching)
+## Refactor Plan: Add Variable-BPM MixRenderer Variant (tempo ramps during transitions)
 
-A) Contracts + validation
+### Goal
+Add a new renderer variant that keeps each track at its **native BPM outside transitions**, and performs a **tempo ramp only during the transition window**:
+- For `A -> B`, mix tempo stays at `bpm(A)` before transition.
+- During overlap, tempo ramps linearly from `bpm(A)` to `bpm(B)`.
+- After overlap, mix tempo is `bpm(B)`.
 
-Implement a real renderer in mix_renderer.py (keep PlaceholderMixRenderer intact).
-Define “track identity” as TrackInput.mix_item_id and validate:
-fixed_tracks is a subset of tracks (ignore/raise if not; choose one behavior and document).
-No duplicates; preserve the exact order of fixed_tracks as the required prefix.
-Validate analysis presence:
-If any TrackInput.analysis_json is missing/invalid, fallback to deterministic “append order only” + simple crossfades.
-B) Analysis extraction helpers (local-first)
+Keep existing `DeterministicMixRenderer` behavior untouched; the new variant is opt-in (pipeline tester switch).
 
-Add helper functions to extract, for each track:
-switch_in and switch_out blocks
-rhythm: bpm_local, bpm_candidates, meter, downbeats_s, beats_s, signature.phase.pattern, signature.phase.stability, signature.periodicity.tempogram_top_peaks
-harmony: key.tonic, key.mode, key.confidence
-quality components: onset_clarity, tempo_stability, spectral_flux, chroma_flux, energy_ramp
-C) Transition scoring (MOST IMPORTANT: tempo)
+---
 
-Implement compute_transition_options(A_out, B_in) -> list[TransitionOption]:
-Evaluate tempo mapping using bpm_candidates (and optionally tempo_scale_used as a prior).
-Pick best option by minimizing abs(delta_bpm_pct); hard-penalize if > ~6%.
-Add secondary penalties:
-key distance (weighted down if either key confidence is low) -- use music-theoretic notions, such as circle of fifths
-signature mismatch (cosine similarity on phase.pattern; compare peak BPM sets from tempogram_top_peaks)
-instability penalty using phase.stability.bar_to_bar_var
-Determinism: all ties broken by (delta_bpm_pct, secondary_cost, mix_item_id).
-D) Ordering with fixed prefix
+### A) New renderer class + selection plumbing
+- Add `VariableBpmMixRenderer` in `atomix/renderers/mix_renderer.py` implementing the same `render(tracks, fixed_tracks)` contract.
+- Keep `PlaceholderMixRenderer` unchanged.
+- Update `mix_pipeline_tester.py` to accept `--renderer {deterministic,variable_bpm}` (default `deterministic`) and instantiate the chosen renderer.
+- Include `renderer_variant` and any new debug fields in the tester’s JSON output for easy comparison.
 
-Build final order:
-prefix = fixed_tracks (exact order)
-remaining = [t for t in tracks if t.mix_item_id not in prefix_ids]
-Optimize order of remaining starting from the last prefix track:
-Build pairwise transition costs using C).
-Use an exact solver for small N (bitmask DP/Held–Karp up to e.g. 10), otherwise deterministic greedy.
-Final order = prefix + optimized_remaining.
-E) Build a deterministic “mix plan” (no audio yet)
+---
 
-For each adjacent pair (A->B), decide:
-chosen tempo mapping (which BPM candidate on B)
-target “mix BPM” (usually A.switch_out bpm)
-overlap length in bars (longer when compatible; short when key/signature clash)
-alignment anchors: downbeat-to-downbeat if available, else beat-to-beat fallback
-F) Audio rendering (MVP)
+### B) Stretching logic (tempo ramp during overlap for BOTH tracks)
+For each transition `A -> B`, both the outgoing overlap of `A` and the incoming overlap of `B`
+must be time-warped so they share the *same instantaneous BPM* throughout the overlap.
 
-Render SR: fixed (e.g. 44100), stereo float32 internal.
-For each track:
-load audio (soundfile or librosa), resample to render SR
-select source regions based on switch windows (start near switch_in.start_s, end near switch_out.end_s)
-For each transition A->B:
-time-stretch B’s incoming region to target BPM (clamp stretch ratio)
-align on bar boundaries using downbeats_s + meter.beats_per_bar (fallback to nearest beat)
-equal-power crossfade over overlap region
-“one bass at a time” MVP: apply simple HPF on incoming during early overlap, then release (scipy butter + lfilter)
-G) Output + segments
+- Define the shared tempo curve over the overlap `t∈[0,T]`:
+  - `bpm(t) = bpm_a + (bpm_b - bpm_a) * (t/T)` (linear ramp)
+- Approximate `bpm(t)` deterministically with `K` chunks (e.g. 16/32):
+  - Choose per-chunk target tempo `bpm_k` (use endpoints for k=0/k=K-1 to ensure continuity):
+    - `bpm_0 = bpm_a`, `bpm_{K-1} = bpm_b`
+- Warp outgoing overlap (A) and incoming overlap (B) to the SAME `bpm_k` per chunk:
+  - For A: `rate_out_k = bpm_k / bpm_a`
+  - For B: `rate_in_k  = bpm_k / bpm_b`
+  - Apply `librosa.effects.time_stretch(..., rate_*)` on each chunk, trim/pad so each chunk outputs
+    exactly `overlap_n/K` samples (so both warped overlaps have exactly `overlap_n` samples total).
+- Crossfade the two warped overlaps (equal-power), then append:
+  - `A_before` un-stretched (native bpm_a)
+  - `B_after` un-stretched (native bpm_b)
 
-Produce:
-RenderResult.audio_bytes as WAV (16-bit PCM) deterministically
-segments: list[SegmentSpec] with per-track start_ms/end_ms/source_start_ms (consistent even with overlaps)
-Acceptance criteria (initial)
+Continuity:
+- Because `rate_out_0 = 1` and `rate_in_{K-1} = 1`, boundaries between un-stretched audio and warped overlap
+  are continuous in tempo (only the overlap is affected).
+---
 
-Respects fixed prefix exactly; deterministic order for remaining tracks.
-Tempo compatibility dominates ordering decisions (local section BPMs).
-Transitions align on downbeats when present; fall back cleanly when not.
-Renderer is deterministic (no randomness; stable tie-breaks).
-Produces valid WAV bytes + segments list for DB persistence.
+### C) Transition scoring update (raw BPM delta + feasibility for BOTH sides)
+When evaluating `A -> B` options (choosing which `bpm_b` candidate to use):
+- Tempo delta term uses RAW BPM change:
+  - `delta_raw_pct = abs(bpm_b - bpm_a) / bpm_a * 100`
+- Feasibility/hard penalty must consider BOTH tracks’ required endpoint stretch:
+  - Outgoing end-rate: `end_rate_out = bpm_b / bpm_a`
+  - Incoming start-rate: `start_rate_in = bpm_a / bpm_b`
+  - If either is outside `[MIN_STRETCH_RATE, MAX_STRETCH_RATE]`, treat option as invalid/huge cost
+    (otherwise A and B cannot “agree on BPM always” during overlap under clamp).
+- Secondary penalties unchanged (key/signature/instability), determinism tie-break unchanged.
+---
 
+### D) Ordering (DP/greedy) uses the variable-BPM transition costs
+- In `VariableBpmMixRenderer._order_tracks`, build `cost_map[(A,B)]` using the **variable-BPM** transition option’s `total_cost`.
+- Keep the existing Held–Karp DP for small N and deterministic greedy for large N.
+- Fixed prefix handling remains identical.
+
+---
+
+### E) Debug + acceptance checks
+Add debug fields to the variable renderer:
+- per transition: `bpm_a`, chosen `bpm_b`, `delta_raw_pct`, `start_rate`, `start_rate_clamped`, `start_match_error_pct`, `K` chunk count.
+- assert determinism: no randomness, stable sorting, consistent rounding.
+
+Acceptance:
+- Outside overlap windows, tracks play at native tempo (no full-chunk time-stretch).
+- During overlap, incoming tempo ramps from `bpm_a` to `bpm_b`.
+- Transition scoring minimizes **raw** BPM change magnitude.
+- Pipeline tester can switch renderer variants and produce comparable debug output.

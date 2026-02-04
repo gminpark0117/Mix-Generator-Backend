@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import math
 import time
@@ -43,6 +44,8 @@ class MixAnalyzer:
         phase_bins_per_bar: int = 96,
         tempogram_peaks: int = 5,
         energy_curve_points: int = 60,
+        switch_region_span_s: float = 30.0,
+        boundary_scan_seconds: float = 30.0,
         enable_timing_logs: bool = False,
     ) -> None:
         self.analysis_sr = analysis_sr
@@ -50,6 +53,9 @@ class MixAnalyzer:
         self.phase_bins_per_bar = phase_bins_per_bar
         self.tempogram_peaks = tempogram_peaks
         self.energy_curve_points = energy_curve_points
+        self.switch_region_span_s = max(4.0, float(switch_region_span_s))
+        self.boundary_scan_seconds = max(0.0, float(boundary_scan_seconds))
+        self.audio_load_res_type = "soxr_hq" if importlib.util.find_spec("soxr") is not None else "kaiser_fast"
         self.enable_timing_logs = enable_timing_logs
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
@@ -75,6 +81,9 @@ class MixAnalyzer:
                 "phase_bins_per_bar": self.phase_bins_per_bar,
                 "tempogram_peaks": self.tempogram_peaks,
                 "energy_curve_points": self.energy_curve_points,
+                "switch_region_span_s": self.switch_region_span_s,
+                "boundary_scan_seconds": self.boundary_scan_seconds,
+                "audio_load_res_type": self.audio_load_res_type,
                 "enable_timing_logs": self.enable_timing_logs,
                 "variant_name": self.VARIANT_NAME,
                 "use_global_hpss": self.USE_GLOBAL_HPSS,
@@ -91,18 +100,35 @@ class MixAnalyzer:
             self._record_timing(debug, "total", total_start)
             return AnalysisResult(metadata_json=metadata_json, analysis_json=self._empty_analysis(debug))
 
+        boundary_scan_active = bool((not self.USE_GLOBAL_HPSS) and self.boundary_scan_seconds > 0.0)
+        y = None
+        sr = int(self.analysis_sr)
+        duration_s = 0.0
+        boundary_segments: list[tuple[float, float, Any]] = []
+
         step_start = time.perf_counter()
         try:
-            y, sr = self._load_audio(abs_path, debug)
+            if boundary_scan_active:
+                boundary_segments, sr, duration_s = self._load_boundary_segments(abs_path, debug)
+                if boundary_segments:
+                    debug["decisions"]["boundary_scan_active"] = True
+                    debug["decisions"]["boundary_segments"] = [
+                        {"start_s": float(s), "end_s": float(e)} for s, e, _ in boundary_segments
+                    ]
+                else:
+                    y, sr = self._load_audio(abs_path, debug)
+                    duration_s = float(librosa.get_duration(y=y, sr=sr))
+                    boundary_segments = [(0.0, float(duration_s), y)]
+                    debug["fallbacks"].append("boundary_scan_fallback_full_load")
+            else:
+                y, sr = self._load_audio(abs_path, debug)
+                duration_s = float(librosa.get_duration(y=y, sr=sr))
         except Exception as exc:  # pragma: no cover - dependent on file IO
             debug["errors"].append(f"audio_load_failed: {exc}")
             self._record_timing(debug, "load_audio", step_start)
             self._record_timing(debug, "total", total_start)
             return AnalysisResult(metadata_json=metadata_json, analysis_json=self._empty_analysis(debug))
         self._record_timing(debug, "load_audio", step_start)
-
-        sr = int(sr)
-        duration_s = float(librosa.get_duration(y=y, sr=sr))
 
         y_harm_full = None
         y_perc_full = None
@@ -111,31 +137,106 @@ class MixAnalyzer:
             y_harm_full, y_perc_full = librosa.effects.hpss(y)
             self._record_timing(debug, "hpss_global", step_start)
 
+        segment_onsets: list[tuple[float, Any, Any]] = []
         step_start = time.perf_counter()
-        onset_source = y_perc_full if y_perc_full is not None else y
-        onset_env_full = librosa.onset.onset_strength(y=onset_source, sr=sr, hop_length=self.hop_length)
-        onset_times_full = librosa.frames_to_time(
-            np.arange(len(onset_env_full)),
-            sr=sr,
-            hop_length=self.hop_length,
-        )
+        if boundary_scan_active:
+            onset_env_parts: list[Any] = []
+            onset_time_parts: list[Any] = []
+            for seg_start_s, _seg_end_s, seg_audio in boundary_segments:
+                onset_seg = librosa.onset.onset_strength(y=seg_audio, sr=sr, hop_length=self.hop_length)
+                onset_times_seg = (
+                    librosa.frames_to_time(
+                        np.arange(len(onset_seg)),
+                        sr=sr,
+                        hop_length=self.hop_length,
+                    )
+                    + float(seg_start_s)
+                )
+                segment_onsets.append((float(seg_start_s), onset_seg, onset_times_seg))
+                onset_env_parts.append(onset_seg)
+                onset_time_parts.append(onset_times_seg)
+            onset_env_full = (
+                np.concatenate(onset_env_parts)
+                if onset_env_parts
+                else np.asarray([], dtype=np.float32)
+            )
+            onset_times_full = (
+                np.concatenate(onset_time_parts)
+                if onset_time_parts
+                else np.asarray([], dtype=np.float32)
+            )
+        else:
+            onset_source = y_perc_full if y_perc_full is not None else y
+            onset_env_full = librosa.onset.onset_strength(y=onset_source, sr=sr, hop_length=self.hop_length)
+            onset_times_full = librosa.frames_to_time(
+                np.arange(len(onset_env_full)),
+                sr=sr,
+                hop_length=self.hop_length,
+            )
         self._record_timing(debug, "onset_full", step_start)
 
         step_start = time.perf_counter()
-        beats_s_full = self._beat_track_from_onset(onset_env_full, sr)
+        if boundary_scan_active:
+            beats_s_full: list[float] = []
+            for seg_start_s, onset_seg, _ in segment_onsets:
+                beats_seg = self._beat_track_from_onset(onset_seg, sr)
+                beats_s_full.extend([float(seg_start_s + b) for b in beats_seg])
+            beats_s_full = sorted(self._clean_floats(beats_s_full))
+        else:
+            beats_s_full = self._beat_track_from_onset(onset_env_full, sr)
         global_bpm_guess, _ = self._tempo_from_beats(beats_s_full)
         self._record_timing(debug, "beats_full", step_start)
 
         step_start = time.perf_counter()
-        rms_full, rms_times_full = self._rms_curve(y, sr)
-        flux_source = y_perc_full if y_perc_full is not None else y
-        chroma_source = y_harm_full if y_harm_full is not None else y
-        flux_full, flux_times_full = self._spectral_flux(flux_source, sr)
-        chroma_flux_full, chroma_times_full = self._chroma_flux(chroma_source, sr)
+        if boundary_scan_active:
+            rms_parts: list[Any] = []
+            rms_times_parts: list[Any] = []
+            flux_parts: list[Any] = []
+            flux_times_parts: list[Any] = []
+            chroma_parts: list[Any] = []
+            chroma_times_parts: list[Any] = []
+            for seg_start_s, _seg_end_s, seg_audio in boundary_segments:
+                rms_seg, rms_times_seg = self._rms_curve(seg_audio, sr)
+                flux_seg, flux_times_seg = self._spectral_flux(seg_audio, sr)
+                chroma_seg, chroma_times_seg = self._chroma_flux(seg_audio, sr)
+                rms_parts.append(rms_seg)
+                rms_times_parts.append(rms_times_seg + float(seg_start_s))
+                flux_parts.append(flux_seg)
+                flux_times_parts.append(flux_times_seg + float(seg_start_s))
+                chroma_parts.append(chroma_seg)
+                chroma_times_parts.append(chroma_times_seg + float(seg_start_s))
+
+            rms_full = np.concatenate(rms_parts) if rms_parts else np.asarray([], dtype=np.float32)
+            rms_times_full = (
+                np.concatenate(rms_times_parts)
+                if rms_times_parts
+                else np.asarray([], dtype=np.float32)
+            )
+            flux_full = np.concatenate(flux_parts) if flux_parts else np.asarray([], dtype=np.float32)
+            flux_times_full = (
+                np.concatenate(flux_times_parts)
+                if flux_times_parts
+                else np.asarray([], dtype=np.float32)
+            )
+            chroma_flux_full = (
+                np.concatenate(chroma_parts)
+                if chroma_parts
+                else np.asarray([], dtype=np.float32)
+            )
+            chroma_times_full = (
+                np.concatenate(chroma_times_parts)
+                if chroma_times_parts
+                else np.asarray([], dtype=np.float32)
+            )
+        else:
+            rms_full, rms_times_full = self._rms_curve(y, sr)
+            flux_source = y_perc_full if y_perc_full is not None else y
+            chroma_source = y_harm_full if y_harm_full is not None else y
+            flux_full, flux_times_full = self._spectral_flux(flux_source, sr)
+            chroma_flux_full, chroma_times_full = self._chroma_flux(chroma_source, sr)
         self._record_timing(debug, "global_curves", step_start)
 
-        # Force switch search regions to the first/last 30 seconds.
-        region_span = 30.0
+        region_span = float(self.switch_region_span_s)
         intro_region = (0.0, min(duration_s, region_span))
         outro_region = (max(0.0, duration_s - region_span), duration_s)
 
@@ -181,6 +282,7 @@ class MixAnalyzer:
             start_s=switch_in_window["start_s"],
             end_s=switch_in_window["end_s"],
             y=y,
+            boundary_segments=boundary_segments if boundary_scan_active else None,
             y_harm_full=y_harm_full,
             y_perc_full=y_perc_full,
             sr=sr,
@@ -196,6 +298,7 @@ class MixAnalyzer:
             start_s=switch_out_window["start_s"],
             end_s=switch_out_window["end_s"],
             y=y,
+            boundary_segments=boundary_segments if boundary_scan_active else None,
             y_harm_full=y_harm_full,
             y_perc_full=y_perc_full,
             sr=sr,
@@ -227,29 +330,87 @@ class MixAnalyzer:
 
         return AnalysisResult(metadata_json=metadata_json, analysis_json=analysis_json)
 
-    def _load_audio(self, abs_path: str, debug: dict[str, Any]) -> tuple[Any, int]:
+    def _probe_duration(self, abs_path: str, debug: dict[str, Any]) -> float | None:
         try:
-            y, sr = librosa.load(
-                abs_path,
-                sr=self.analysis_sr,
-                mono=True,
-                res_type="kaiser_fast",
-            )
-            return y, int(sr)
-        except ModuleNotFoundError as exc:
-            # kaiser_fast depends on resampy in some librosa setups.
-            if "resampy" not in str(exc):
+            duration_s = float(librosa.get_duration(path=abs_path))
+            if math.isfinite(duration_s) and duration_s > 0:
+                return duration_s
+        except Exception:
+            debug["fallbacks"].append("duration_probe_failed")
+        return None
+
+    def _load_boundary_segments(
+        self,
+        abs_path: str,
+        debug: dict[str, Any],
+    ) -> tuple[list[tuple[float, float, Any]], int, float]:
+        duration_s = self._probe_duration(abs_path, debug)
+        if duration_s is None:
+            return [], int(self.analysis_sr), 0.0
+
+        span = float(min(self.boundary_scan_seconds, duration_s))
+        intro_end_s = span
+        outro_start_s = max(0.0, duration_s - span)
+
+        ranges: list[tuple[float, float]] = [(0.0, intro_end_s)]
+        if outro_start_s > intro_end_s + 1e-6:
+            ranges.append((outro_start_s, duration_s))
+
+        segments: list[tuple[float, float, Any]] = []
+        sr_out: int | None = None
+        for start_s, end_s in ranges:
+            clip_duration = max(0.0, float(end_s - start_s))
+            if clip_duration <= 0.0:
+                continue
+            clip, sr = self._load_audio(abs_path, debug, offset_s=start_s, duration_s=clip_duration)
+            sr_out = int(sr if sr_out is None else sr_out)
+            segments.append((float(start_s), float(end_s), clip))
+
+        return segments, int(sr_out or self.analysis_sr), float(duration_s)
+
+    def _load_audio(
+        self,
+        abs_path: str,
+        debug: dict[str, Any],
+        *,
+        offset_s: float = 0.0,
+        duration_s: float | None = None,
+    ) -> tuple[Any, int]:
+        res_types: list[str] = []
+        preferred = str(self.audio_load_res_type or "").strip()
+        if preferred:
+            res_types.append(preferred)
+        if "soxr_hq" not in res_types:
+            res_types.append("soxr_hq")
+        if "kaiser_fast" not in res_types:
+            res_types.append("kaiser_fast")
+
+        last_exc: Exception | None = None
+        for idx, res_type in enumerate(res_types):
+            try:
+                y, sr = librosa.load(
+                    abs_path,
+                    sr=self.analysis_sr,
+                    mono=True,
+                    offset=max(0.0, float(offset_s)),
+                    duration=(None if duration_s is None else max(0.0, float(duration_s))),
+                    res_type=res_type,
+                )
+                if idx > 0:
+                    debug["fallbacks"].append(f"audio_load_res_type_fallback_{res_type}")
+                return y, int(sr)
+            except ModuleNotFoundError as exc:
+                last_exc = exc
+                msg = str(exc)
+                if res_type.startswith("soxr_") and "soxr" in msg:
+                    continue
+                if res_type.startswith("kaiser") and "resampy" in msg:
+                    continue
                 raise
-            debug["fallbacks"].append("audio_load_resampy_missing_fallback_soxr_hq")
-            if self.enable_timing_logs:
-                self.logger.warning("resampy missing; falling back to librosa.load res_type=soxr_hq")
-            y, sr = librosa.load(
-                abs_path,
-                sr=self.analysis_sr,
-                mono=True,
-                res_type="soxr_hq",
-            )
-            return y, int(sr)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("audio_load_failed_no_resampler")
 
     def _record_timing(self, debug: dict[str, Any], label: str, start: float) -> None:
         elapsed = float(time.perf_counter() - start)
@@ -416,13 +577,46 @@ class MixAnalyzer:
             },
         }
 
+    def _slice_from_boundary_segments(
+        self,
+        *,
+        boundary_segments: list[tuple[float, float, Any]],
+        start_s: float,
+        end_s: float,
+        sr: int,
+    ) -> Any:
+        for seg_start_s, seg_end_s, seg_audio in boundary_segments:
+            if start_s >= (seg_start_s - 1e-6) and end_s <= (seg_end_s + 1e-6):
+                rel_start = max(0.0, float(start_s - seg_start_s))
+                rel_end = max(rel_start, float(end_s - seg_start_s))
+                start_idx = int(rel_start * sr)
+                end_idx = int(rel_end * sr)
+                return seg_audio[start_idx:end_idx]
+
+        pieces: list[Any] = []
+        for seg_start_s, seg_end_s, seg_audio in boundary_segments:
+            clip_start = max(float(start_s), float(seg_start_s))
+            clip_end = min(float(end_s), float(seg_end_s))
+            if clip_end <= clip_start:
+                continue
+            rel_start = clip_start - float(seg_start_s)
+            rel_end = clip_end - float(seg_start_s)
+            start_idx = int(rel_start * sr)
+            end_idx = int(rel_end * sr)
+            if end_idx > start_idx:
+                pieces.append(seg_audio[start_idx:end_idx])
+        if pieces:
+            return np.concatenate(pieces)
+        return np.asarray([], dtype=np.float32)
+
     def _analyze_section(
         self,
         *,
         label: str,
         start_s: float,
         end_s: float,
-        y: Any,
+        y: Any | None,
+        boundary_segments: list[tuple[float, float, Any]] | None,
         y_harm_full: Any,
         y_perc_full: Any,
         sr: int,
@@ -446,9 +640,37 @@ class MixAnalyzer:
                 "energy": {},
             }
 
-        start_idx = int(start_s * sr)
-        end_idx = int(end_s * sr)
-        y_section = y[start_idx:end_idx]
+        if y is not None:
+            start_idx = int(start_s * sr)
+            end_idx = int(end_s * sr)
+            y_section = y[start_idx:end_idx]
+        elif boundary_segments:
+            y_section = self._slice_from_boundary_segments(
+                boundary_segments=boundary_segments,
+                start_s=start_s,
+                end_s=end_s,
+                sr=sr,
+            )
+            start_idx = int(start_s * sr)
+            end_idx = int(end_s * sr)
+        else:
+            y_section = np.asarray([], dtype=np.float32)
+            start_idx = int(start_s * sr)
+            end_idx = int(end_s * sr)
+
+        if len(y_section) == 0:
+            debug["fallbacks"].append(f"{label}_audio_slice_empty")
+            self._record_timing(debug, f"{timing_prefix}.total", section_total_start)
+            return {
+                "start_s": float(start_s),
+                "end_s": float(end_s),
+                "quality": quality,
+                "rhythm": {},
+                "harmony": {},
+                "timbre": {},
+                "spectral": {},
+                "energy": {},
+            }
 
         step_start = time.perf_counter()
         if self.USE_GLOBAL_HPSS and y_harm_full is not None and y_perc_full is not None:
