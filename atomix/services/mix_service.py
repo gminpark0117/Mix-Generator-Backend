@@ -9,7 +9,7 @@ from atomix.repos.audio_asset_repo import AudioAssetRepo
 from atomix.repos.mix_repo import MixRepo
 from atomix.services.storage_service import StorageService
 from atomix.renderers.mix_renderer import PlaceholderMixRenderer, TrackInput
-from atomix.analyzers.mix_analyzer import PlaceholderMixAnalyzer
+from atomix.analyzers.mix_analyzer import MixAnalyzer
 from atomix.schemas.mix import MixStateOut, MixRevisionResponse, RevisionOut, SegmentOut
 from atomix.core.config import settings
 
@@ -45,7 +45,7 @@ class MixService:
 
         self.storage = StorageService()
         self.renderer = PlaceholderMixRenderer()  # swap later with real renderer
-        self.analyzer = PlaceholderMixAnalyzer()  # swap later with real analyzer
+        self.analyzer = MixAnalyzer()
 
     async def create_mix(self, *, files: list[UploadFile], tracks_metadata: str) -> MixRevisionResponse:
         metas = parse_tracks_metadata(tracks_metadata, len(files))

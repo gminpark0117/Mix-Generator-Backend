@@ -6,3 +6,7 @@ alembic==1.13.3
 pydantic-settings==2.6.1
 python-multipart==0.0.12
 psycopg[binary]==3.3.2
+numpy==1.26.4
+scipy==1.11.4
+librosa==0.10.2.post1
+soundfile==0.12.1

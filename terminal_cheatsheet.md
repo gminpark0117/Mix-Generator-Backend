@@ -145,3 +145,28 @@ docker compose logs -f
     Alembic needs a sync driver (psycopg/psycopg2) even if runtime uses asyncpg.
 
     If alembic revision --autogenerate doesn’t detect tables, your alembic/env.py probably isn’t importing atomix.models properly.
+
+
+
+
+
+
+To update on ec2:
+# On EC2
+cd ~/Mix-Generator-Backend
+git pull origin main
+
+# If requirements changed
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# If database models changed
+alembic upgrade head
+
+# Restart the service
+sudo systemctl restart atomix
+
+# On EC2, verify everything:
+sudo systemctl status atomix
+sudo journalctl -u atomix -n 50 -f  # Watch logs
+curl http://localhost:8000/docs  
