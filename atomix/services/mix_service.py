@@ -267,14 +267,16 @@ class MixService:
 
             # 3) Determine fixed tracks
             freeze_ms = client_playhead_ms + settings.LOOKAHEAD_MS
-            fixed_track_ids: set[uuid.UUID] = set()
-
             current_segments = await self.mixes.list_segments_for_revision(current_rev.id)
-            for seg in current_segments:
-                if seg.start_ms < freeze_ms:
-                    fixed_track_ids.add(seg.mix_item_id)
 
-            fixed_tracks = [t for t in track_inputs if t.mix_item_id in fixed_track_ids]
+            # Preserve current timeline order for the fixed prefix (renderer treats fixed_tracks as ordered prefix).
+            fixed_track_ids_ordered: list[uuid.UUID] = []
+            for seg in current_segments:
+                if seg.start_ms < freeze_ms and seg.mix_item_id not in fixed_track_ids_ordered:
+                    fixed_track_ids_ordered.append(seg.mix_item_id)
+
+            track_by_id = {t.mix_item_id: t for t in track_inputs}
+            fixed_tracks = [track_by_id[tid] for tid in fixed_track_ids_ordered if tid in track_by_id]
 
             # 4) Render new mix
             render_result = await self.renderer.render(track_inputs, fixed_tracks)
