@@ -35,7 +35,7 @@ class StorageService:
     Guarantees:
     - Generates safe file keys (no user path traversal)
     - Writes atomically (tmp file + replace)
-    - Produces a URL your client can GET directly (via StaticFiles mount)
+    - Produces a URL your client can GET directly (served under /storage with byte-range support)
     """
 
     def __init__(
