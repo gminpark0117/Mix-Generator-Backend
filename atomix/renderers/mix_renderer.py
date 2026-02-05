@@ -125,20 +125,22 @@ class DeterministicMixRenderer:
     RENDER_SR = 44100
     CHANNELS = 2
     SAMPWIDTH = 2
+    ENFORCE_EXACT_BEAT_ALIGNMENT = True
 
     SIMPLE_OVERLAP_S = 6.0
     MIN_OVERLAP_S = 4.0
     MAX_OVERLAP_S = 20.0
     MAX_DP_TRACKS = 10
     MAX_STRETCH_DELTA_PCT = 6.0
-    MIN_STRETCH_RATE = 0.94
-    MAX_STRETCH_RATE = 1.06
+    MIN_STRETCH_RATE = 0.8
+    MAX_STRETCH_RATE = 1.2
     BASS_SWAP_HPF_HZ = 180.0
     # WAV is deterministic and fast to encode (use MP3 only when you explicitly need smaller files).
     DEFAULT_OUTPUT_MIME = "audio/wav"
     TRIM_PAD_PRE_S = 0.25
     TRIM_PAD_POST_S = 0.75
     MIN_TRIMMED_WINDOW_S = 8.0
+    WARP_SLICE_CROSSFADE_MS = 8.0
 
     def __init__(
         self,
@@ -535,7 +537,12 @@ class DeterministicMixRenderer:
 
             # Propagate the actually-achieved tempo to keep subsequent transitions coherent.
             # (When clamped, option.target_bpm may not be fully achieved.)
-            achieved = float(option.incoming_bpm * option.stretch_rate) if option.incoming_bpm > 0 else float(bpm)
+            applied_rate = self._transition_match_rate(
+                target_bpm=float(option.target_bpm),
+                incoming_bpm=float(option.incoming_bpm),
+                fallback_rate=float(option.stretch_rate),
+            )
+            achieved = float(option.incoming_bpm * applied_rate) if option.incoming_bpm > 0 else float(bpm)
             if math.isfinite(achieved) and achieved > 0:
                 current_bpm = achieved
         return plans
@@ -775,7 +782,12 @@ class DeterministicMixRenderer:
                 source_start_s = 0.0
                 incoming = self._load_audio_stereo(incoming_track.abs_path)
 
-            incoming = self._time_stretch_stereo(incoming, plan.option.stretch_rate)
+            incoming_rate = self._transition_match_rate(
+                target_bpm=float(plan.option.target_bpm),
+                incoming_bpm=float(plan.option.incoming_bpm),
+                fallback_rate=float(plan.option.stretch_rate),
+            )
+            incoming = self._time_stretch_stereo(incoming, incoming_rate)
 
             overlap_n = int(round(plan.overlap_s * self.RENDER_SR))
 
@@ -787,14 +799,15 @@ class DeterministicMixRenderer:
             # Ensure overlap is feasible within the outgoing chunk.
             overlap_n = int(np.clip(overlap_n, 1, max(1, len(out_chunk) - 1)))
             default_start_n = max(out_start_n, total_len_n - overlap_n)
-            transition_start_n = self._pick_outgoing_transition_start(
+            transition_start_n, overlap_n, _ = self._pick_aligned_transition_start(
                 default_transition_start_n=default_start_n,
                 mix_len_n=total_len_n,
                 overlap_n=overlap_n,
+                out_start_n=out_start_n,
                 outgoing_feat=outgoing_feat,
                 placed=placed,
             )
-            transition_start_n = int(np.clip(transition_start_n, out_start_n, total_len_n - overlap_n))
+            transition_start_n = int(np.clip(transition_start_n, out_start_n, total_len_n - 1))
             start_in_chunk = transition_start_n - out_start_n
             overlap_n = int(np.clip(overlap_n, 1, max(1, len(out_chunk) - start_in_chunk)))
 
@@ -841,7 +854,7 @@ class DeterministicMixRenderer:
             placed = _PlacedTrack(
                 track=incoming_track,
                 source_start_s=source_start_s,
-                stretch_rate=plan.option.stretch_rate,
+                stretch_rate=incoming_rate,
                 mix_start_s=transition_start_n / self.RENDER_SR,
             )
 
@@ -933,6 +946,83 @@ class DeterministicMixRenderer:
         mix_audio = np.vstack(chunks) if len(chunks) > 1 else chunks[0]
         return mix_audio, segments
 
+    def _resolve_stretch_rate(self, *, raw_rate: float) -> float:
+        if not math.isfinite(raw_rate) or raw_rate <= 0.0:
+            return 1.0
+        if self.ENFORCE_EXACT_BEAT_ALIGNMENT:
+            return float(raw_rate)
+        return float(np.clip(raw_rate, self.MIN_STRETCH_RATE, self.MAX_STRETCH_RATE))
+
+    def _transition_match_rate(self, *, target_bpm: float, incoming_bpm: float, fallback_rate: float) -> float:
+        if target_bpm > 0.0 and incoming_bpm > 0.0:
+            raw_rate = float(target_bpm) / max(float(incoming_bpm), 1e-9)
+            return self._resolve_stretch_rate(raw_rate=raw_rate)
+        return self._resolve_stretch_rate(raw_rate=float(fallback_rate))
+
+    def _transition_anchor_samples(
+        self,
+        *,
+        mix_len_n: int,
+        out_start_n: int,
+        outgoing_feat: _TrackFeatures,
+        placed: _PlacedTrack,
+    ) -> list[int]:
+        out = outgoing_feat.switch_out
+        if out is None:
+            return []
+        anchors_s = out.downbeats_s if out.downbeats_s else out.beats_s
+        if not anchors_s:
+            return []
+
+        candidates: list[int] = []
+        for anchor_s in anchors_s:
+            if anchor_s < placed.source_start_s:
+                continue
+            rel = (anchor_s - placed.source_start_s) / max(placed.stretch_rate, 1e-9)
+            abs_s = placed.mix_start_s + rel
+            idx = int(round(abs_s * self.RENDER_SR))
+            if out_start_n <= idx < mix_len_n:
+                candidates.append(idx)
+        if not candidates:
+            return []
+        return sorted(set(candidates))
+
+    def _pick_aligned_transition_start(
+        self,
+        *,
+        default_transition_start_n: int,
+        mix_len_n: int,
+        overlap_n: int,
+        out_start_n: int,
+        outgoing_feat: _TrackFeatures,
+        placed: _PlacedTrack,
+    ) -> tuple[int, int, bool]:
+        max_start = max(out_start_n, mix_len_n - 1)
+        start_default = int(np.clip(default_transition_start_n, out_start_n, max_start))
+        overlap_req = int(max(1, overlap_n))
+
+        anchors = self._transition_anchor_samples(
+            mix_len_n=mix_len_n,
+            out_start_n=out_start_n,
+            outgoing_feat=outgoing_feat,
+            placed=placed,
+        )
+        if not anchors:
+            max_overlap = max(1, mix_len_n - start_default)
+            return start_default, int(min(overlap_req, max_overlap)), False
+
+        if self.ENFORCE_EXACT_BEAT_ALIGNMENT:
+            start_n = min(anchors, key=lambda c: (abs(c - start_default), c))
+            max_overlap = max(1, mix_len_n - start_n)
+            return int(start_n), int(min(overlap_req, max_overlap)), True
+
+        feasible = [c for c in anchors if c <= max(0, mix_len_n - overlap_req)]
+        if not feasible:
+            max_overlap = max(1, mix_len_n - start_default)
+            return start_default, int(min(overlap_req, max_overlap)), False
+        start_n = min(feasible, key=lambda c: (abs(c - start_default), c))
+        return int(start_n), int(overlap_req), True
+
     def _pick_outgoing_transition_start(
         self,
         *,
@@ -942,22 +1032,15 @@ class DeterministicMixRenderer:
         outgoing_feat: _TrackFeatures,
         placed: _PlacedTrack,
     ) -> int:
-        out = outgoing_feat.switch_out
-        if out is None or not out.downbeats_s:
-            return default_transition_start_n
-
-        candidates: list[int] = []
-        for d in out.downbeats_s:
-            if d < placed.source_start_s:
-                continue
-            rel = (d - placed.source_start_s) / max(placed.stretch_rate, 1e-9)
-            abs_s = placed.mix_start_s + rel
-            idx = int(round(abs_s * self.RENDER_SR))
-            if 0 <= idx <= max(0, mix_len_n - overlap_n):
-                candidates.append(idx)
-        if not candidates:
-            return default_transition_start_n
-        return min(candidates, key=lambda c: (abs(c - default_transition_start_n), c))
+        start_n, _, _ = self._pick_aligned_transition_start(
+            default_transition_start_n=default_transition_start_n,
+            mix_len_n=mix_len_n,
+            overlap_n=overlap_n,
+            out_start_n=0,
+            outgoing_feat=outgoing_feat,
+            placed=placed,
+        )
+        return start_n
 
     def _incoming_source_start(self, feat: _TrackFeatures) -> float:
         sec = feat.switch_in
@@ -1611,36 +1694,27 @@ class VariableBpmMixRenderer(DeterministicMixRenderer):
                 else bpm_a
             )
 
-            transition_start_n = out_start_n
-            start_in_chunk = 0
+            default_start_n = max(out_start_n, total_len_n - overlap_n)
+            transition_start_n, overlap_n, _ = self._pick_aligned_transition_start(
+                default_transition_start_n=default_start_n,
+                mix_len_n=total_len_n,
+                overlap_n=overlap_n,
+                out_start_n=out_start_n,
+                outgoing_feat=outgoing_feat,
+                placed=placed,
+            )
+            transition_start_n = int(np.clip(transition_start_n, out_start_n, total_len_n - 1))
+            start_in_chunk = int(np.clip(transition_start_n - out_start_n, 0, max(0, len(out_chunk) - 1)))
             out_needed_n = 1
             for _ in range(6):
-                overlap_n = int(np.clip(overlap_n, 1, max(1, len(out_chunk) - 1)))
+                available = max(1, len(out_chunk) - start_in_chunk)
+                overlap_n = int(np.clip(overlap_n, 1, available))
                 out_needed_n = self._estimate_source_samples(
                     bpm_native=bpm_a,
                     bpm_start=bpm_a,
                     bpm_end=bpm_b,
                     output_n=overlap_n,
                 )
-                max_start_n = total_len_n - max(1, out_needed_n)
-                if max_start_n < out_start_n:
-                    if overlap_n <= 1:
-                        break
-                    ratio = max(0.5, (len(out_chunk) - 1) / max(1, out_needed_n))
-                    overlap_n = max(1, int(math.floor(overlap_n * ratio)))
-                    continue
-
-                default_start_n = max(out_start_n, total_len_n - overlap_n)
-                picked = self._pick_outgoing_transition_start(
-                    default_transition_start_n=default_start_n,
-                    mix_len_n=total_len_n,
-                    overlap_n=overlap_n,
-                    outgoing_feat=outgoing_feat,
-                    placed=placed,
-                )
-                transition_start_n = int(np.clip(picked, out_start_n, max_start_n))
-                start_in_chunk = transition_start_n - out_start_n
-                available = len(out_chunk) - start_in_chunk
                 if out_needed_n <= max(1, available):
                     break
                 if overlap_n <= 1:
@@ -1784,22 +1858,31 @@ class VariableBpmMixRenderer(DeterministicMixRenderer):
         if not chunk_lengths:
             return np.zeros((0, 2), dtype=np.float32), 0
 
+        base_fade_n = max(0, int(round((self.WARP_SLICE_CROSSFADE_MS / 1000.0) * self.RENDER_SR)))
         rendered: list[np.ndarray] = []
         consumed = 0
         n_chunks = len(chunk_lengths)
         for idx, out_len in enumerate(chunk_lengths):
+            extra_out = base_fade_n if idx < n_chunks - 1 else 0
+            out_len_with_overlap = int(out_len + extra_out)
             frac = idx / (n_chunks - 1) if n_chunks > 1 else 1.0
             bpm_target = bpm_start + (bpm_end - bpm_start) * frac
             raw_rate = bpm_target / max(float(bpm_native), 1e-9)
-            rate = float(np.clip(raw_rate, self.MIN_STRETCH_RATE, self.MAX_STRETCH_RATE))
-            src_len = max(1, int(round(out_len * rate)))
+            rate = self._resolve_stretch_rate(raw_rate=float(raw_rate))
+            src_len = max(1, int(round(out_len_with_overlap * rate)))
 
             raw_chunk = src[consumed : consumed + src_len]
             if len(raw_chunk) < src_len:
                 pad_n = src_len - len(raw_chunk)
                 raw_chunk = np.vstack([raw_chunk, np.zeros((pad_n, 2), dtype=np.float32)])
 
-            rendered_chunk = self._stretch_to_length(raw_chunk, rate=rate, target_n=out_len)
+            rendered_chunk = self._stretch_to_length(raw_chunk, rate=rate, target_n=out_len_with_overlap)
+            if rendered:
+                fade_n = int(min(base_fade_n, len(rendered[-1]), len(rendered_chunk)))
+                if fade_n > 0:
+                    blend = self._equal_power_blend(rendered[-1][-fade_n:], rendered_chunk[:fade_n])
+                    rendered[-1] = np.vstack([rendered[-1][:-fade_n], blend])
+                    rendered_chunk = rendered_chunk[fade_n:]
             rendered.append(rendered_chunk)
             consumed += src_len
 
@@ -1813,14 +1896,19 @@ class VariableBpmMixRenderer(DeterministicMixRenderer):
         if output_n <= 0:
             return 0
         chunk_lengths = self._split_lengths(output_n, self.tempo_ramp_chunks)
+        if not chunk_lengths:
+            return 0
+        base_fade_n = max(0, int(round((self.WARP_SLICE_CROSSFADE_MS / 1000.0) * self.RENDER_SR)))
         n_chunks = len(chunk_lengths)
         total = 0
         for idx, out_len in enumerate(chunk_lengths):
+            extra_out = base_fade_n if idx < n_chunks - 1 else 0
+            out_len_with_overlap = int(out_len + extra_out)
             frac = idx / (n_chunks - 1) if n_chunks > 1 else 1.0
             bpm_target = bpm_start + (bpm_end - bpm_start) * frac
             raw_rate = bpm_target / max(float(bpm_native), 1e-9)
-            rate = float(np.clip(raw_rate, self.MIN_STRETCH_RATE, self.MAX_STRETCH_RATE))
-            total += max(1, int(round(out_len * rate)))
+            rate = self._resolve_stretch_rate(raw_rate=float(raw_rate))
+            total += max(1, int(round(out_len_with_overlap * rate)))
         return int(max(1, total))
 
     def _split_lengths(self, total: int, parts: int) -> list[int]:

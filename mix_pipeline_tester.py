@@ -37,9 +37,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--renderer",
-        default="deterministic",
+        default="variable_bpm",
         choices=["deterministic", "variable_bpm"],
-        help="Renderer variant to use for audio rendering.",
+        help="Renderer variant to use for audio rendering (default: variable_bpm).",
     )
     parser.add_argument(
         "--analysis-sr",
