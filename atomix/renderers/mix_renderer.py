@@ -73,6 +73,8 @@ class _SectionInfo:
     phase_var: float
     tempogram_peaks: tuple[float, ...]
     key: _KeyInfo
+    mfcc_mean: tuple[float, ...]
+    mfcc_std: tuple[float, ...]
     onset_clarity: float
     tempo_stability: float
     spectral_flux: float
@@ -449,6 +451,7 @@ class DeterministicMixRenderer:
 
         quality = self._as_dict(section_d.get("quality"))
         comp = self._as_dict(quality.get("components"))
+        timbre = self._as_dict(section_d.get("timbre"))
 
         return _SectionInfo(
             start_s=self._to_float(section_d.get("start_s"), default=0.0),
@@ -464,6 +467,8 @@ class DeterministicMixRenderer:
             phase_var=max(0.0, float(phase_var)),
             tempogram_peaks=tuple(peaks),
             key=key,
+            mfcc_mean=self._float_tuple(timbre.get("mfcc_mean")),
+            mfcc_std=self._float_tuple(timbre.get("mfcc_std")),
             onset_clarity=self._to_float(comp.get("onset_clarity"), default=0.0),
             tempo_stability=self._to_float(comp.get("tempo_stability"), default=0.0),
             spectral_flux=self._to_float(comp.get("spectral_flux"), default=0.0),
@@ -548,7 +553,7 @@ class DeterministicMixRenderer:
                 stretch_rate=1.0,
                 key_penalty=0.5,
                 signature_penalty=0.5,
-                instability_penalty=1.0,
+                instability_penalty=0.0,
                 secondary_cost=2.0,
                 total_cost=9999.0,
                 key_clash=False,
@@ -564,7 +569,7 @@ class DeterministicMixRenderer:
                 stretch_rate=1.0,
                 key_penalty=0.5,
                 signature_penalty=0.5,
-                instability_penalty=1.0,
+                instability_penalty=0.0,
                 secondary_cost=2.0,
                 total_cost=9999.0,
                 key_clash=False,
@@ -591,8 +596,8 @@ class DeterministicMixRenderer:
             key_weight = min(max(a_out.key.confidence, 0.0), max(b_in.key.confidence, 0.0))
             key_pen_w = key_pen * key_weight
             sig_pen = self._signature_penalty(a_out, b_in)
-            instab = min(1.0, a_out.phase_var + b_in.phase_var)
-            sec = 0.8 * key_pen_w + 1.0 * sig_pen + 0.4 * instab
+            timbre_pen = self._timbre_penalty(a_out, b_in)
+            sec = 0.8 * key_pen_w + 1.0 * sig_pen + 1.0 * timbre_pen
             total = tempo_cost * 100.0 + sec * 10.0
 
             options.append(
@@ -603,7 +608,7 @@ class DeterministicMixRenderer:
                     stretch_rate=stretch,
                     key_penalty=key_pen_w,
                     signature_penalty=sig_pen,
-                    instability_penalty=instab,
+                    instability_penalty=0.0,
                     secondary_cost=sec,
                     total_cost=total,
                     key_clash=(key_pen_w >= 0.55),
@@ -663,6 +668,27 @@ class DeterministicMixRenderer:
             if diffs:
                 t_pen = float(np.clip(np.mean(diffs), 0.0, 1.0))
         return float(0.7 * p_pen + 0.3 * t_pen)
+
+    def _timbre_penalty(self, a: _SectionInfo, b: _SectionInfo) -> float:
+        n = min(len(a.mfcc_mean), len(b.mfcc_mean), len(a.mfcc_std), len(b.mfcc_std))
+        if n <= 0:
+            return 0.5
+
+        mean_a = np.nan_to_num(np.asarray(a.mfcc_mean[:n], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        mean_b = np.nan_to_num(np.asarray(b.mfcc_mean[:n], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        std_a = np.nan_to_num(np.abs(np.asarray(a.mfcc_std[:n], dtype=np.float64)), nan=0.0, posinf=0.0, neginf=0.0)
+        std_b = np.nan_to_num(np.abs(np.asarray(b.mfcc_std[:n], dtype=np.float64)), nan=0.0, posinf=0.0, neginf=0.0)
+
+        pooled_var = np.maximum(0.5 * (np.square(std_a) + np.square(std_b)), 1e-6)
+        diff = mean_a - mean_b
+        md_sq = float(np.sum(np.square(diff) / pooled_var))
+        if not math.isfinite(md_sq) or md_sq < 0.0:
+            return 0.5
+
+        dist = math.sqrt(md_sq)
+        scale = max(math.sqrt(float(n)), 1.0)
+        normalized = dist / (dist + scale)
+        return float(np.clip(normalized, 0.0, 1.0))
 
     # ---------- Rendering ----------
 
@@ -1451,7 +1477,7 @@ class VariableBpmMixRenderer(DeterministicMixRenderer):
                 stretch_rate=start_clamped,
                 key_penalty=0.5,
                 signature_penalty=0.5,
-                instability_penalty=1.0,
+                instability_penalty=0.0,
                 secondary_cost=2.0,
                 total_cost=9999.0 + start_err + end_err + abs(start_raw - start_clamped),
                 key_clash=False,
@@ -1484,8 +1510,8 @@ class VariableBpmMixRenderer(DeterministicMixRenderer):
             key_weight = min(max(a_out.key.confidence, 0.0), max(b_in.key.confidence, 0.0))
             key_pen_w = key_pen * key_weight
             sig_pen = self._signature_penalty(a_out, b_in)
-            instab = min(1.0, a_out.phase_var + b_in.phase_var)
-            sec = 0.8 * key_pen_w + 1.0 * sig_pen + 0.4 * instab
+            timbre_pen = self._timbre_penalty(a_out, b_in)
+            sec = 0.8 * key_pen_w + 1.0 * sig_pen + 1.0 * timbre_pen
             total = tempo_cost * 100.0 + sec * 10.0
 
             options.append(
@@ -1496,7 +1522,7 @@ class VariableBpmMixRenderer(DeterministicMixRenderer):
                     stretch_rate=start_rate,
                     key_penalty=key_pen_w,
                     signature_penalty=sig_pen,
-                    instability_penalty=instab,
+                    instability_penalty=0.0,
                     secondary_cost=sec,
                     total_cost=total,
                     key_clash=(key_pen_w >= 0.55),

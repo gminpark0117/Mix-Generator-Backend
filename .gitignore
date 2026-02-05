@@ -4,3 +4,4 @@ __pycache__/
 .env
 testmusic/*
 mix_pipeline_outputs/
+storage/*
