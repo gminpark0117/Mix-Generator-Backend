@@ -45,7 +45,7 @@ class MixService:
 
         self.storage = StorageService()
         self.renderer = VariableBpmMixRenderer(enable_timing_logs=True, enable_debug_logs=True)
-        self.analyzer = MixAnalyzer()
+        self.analyzer = MixAnalyzer(force_beats_per_bar_4=True)
 
     async def create_mix(self, *, files: list[UploadFile], tracks_metadata: str) -> MixRevisionResponse:
         metas = parse_tracks_metadata(tracks_metadata, len(files))

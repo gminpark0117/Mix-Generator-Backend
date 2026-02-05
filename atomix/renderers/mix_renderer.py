@@ -1127,12 +1127,20 @@ class DeterministicMixRenderer:
         y = np.asarray(audio, dtype=np.float32)
         if y.ndim != 2 or y.shape[1] != 2:
             y = self._ensure_float_array(y).reshape((-1, 2)) if y.size else np.zeros((0, 2), dtype=np.float32)
-        yt_raw = librosa.effects.time_stretch(
-            y.T,
-            rate=rate,
-            n_fft=int(self.time_stretch_n_fft),
-            hop_length=int(self.time_stretch_hop_length),
-        )
+        try:
+            yt_raw = librosa.effects.time_stretch(
+                y.T,
+                rate=rate,
+                n_fft=int(self.time_stretch_n_fft),
+                hop_length=int(self.time_stretch_hop_length),
+            )
+        except MemoryError:
+            self.logger.warning(
+                "Librosa time_stretch OOM for %d samples; falling back to chunked stretching (rate=%.6f).",
+                int(len(y)),
+                float(rate),
+            )
+            return self._time_stretch_stereo_chunked(y, rate)
         yt = self._ensure_float_array(yt_raw)
         if yt.ndim != 2:
             return np.zeros((0, 2), dtype=np.float32)
@@ -1140,6 +1148,88 @@ class DeterministicMixRenderer:
             yt = np.vstack([yt, yt])
         out = yt[:2, :].T
         return out.astype(np.float32)
+
+    def _time_stretch_stereo_chunked(self, audio: np.ndarray, rate: float) -> np.ndarray:
+        y = np.asarray(audio, dtype=np.float32)
+        if y.size == 0 or abs(rate - 1.0) <= 1e-5:
+            return y
+        if y.ndim != 2 or y.shape[1] != 2:
+            y = self._ensure_float_array(y).reshape((-1, 2)) if y.size else np.zeros((0, 2), dtype=np.float32)
+
+        n_fft = int(self.time_stretch_n_fft)
+        hop_length = int(self.time_stretch_hop_length)
+        freq_bins = 1 + (n_fft // 2)
+
+        # Keep per-chunk STFT buffers bounded to avoid OOM.
+        # Rough peak allocation for phase-vocoder buffers is O(channels * freq_bins * frames).
+        target_bytes = 48 * 1024 * 1024
+        bytes_per_frame = 2 * freq_bins * 8  # complex64 per bin
+        target_frames = max(256, int(target_bytes // max(1, bytes_per_frame)))
+        chunk_in_n = max(hop_length * 8, int(target_frames * hop_length))
+        chunk_in_n = int((chunk_in_n // hop_length) * hop_length)
+
+        pad_in_n = min(int(round(0.25 * self.RENDER_SR)), max(0, chunk_in_n // 4))
+        fade_n = int(round(0.02 * self.RENDER_SR))
+
+        out_chunks: list[np.ndarray] = []
+        start_in = 0
+        total_in_n = int(len(y))
+        while start_in < total_in_n:
+            center_end_in = min(total_in_n, start_in + chunk_in_n)
+            read_start_in = max(0, start_in - pad_in_n)
+            read_end_in = min(total_in_n, center_end_in + pad_in_n)
+
+            y_read = y[read_start_in:read_end_in].T
+            try:
+                stretched_raw = librosa.effects.time_stretch(
+                    y_read,
+                    rate=rate,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                )
+            except MemoryError:
+                # Reduce chunk size and retry deterministically.
+                if chunk_in_n <= hop_length * 8:
+                    raise
+                chunk_in_n = int(max(hop_length * 8, chunk_in_n // 2))
+                chunk_in_n = int((chunk_in_n // hop_length) * hop_length)
+                continue
+
+            stretched = self._ensure_float_array(stretched_raw)
+            if stretched.ndim != 2:
+                return np.zeros((0, 2), dtype=np.float32)
+            if stretched.shape[0] < 2:
+                stretched = np.vstack([stretched, stretched])
+
+            keep_start_out = int(round((start_in - read_start_in) / rate))
+            keep_end_out = int(round((center_end_in - read_start_in) / rate))
+            keep_start_out = int(np.clip(keep_start_out, 0, stretched.shape[1]))
+            keep_end_out = int(np.clip(keep_end_out, keep_start_out, stretched.shape[1]))
+            chunk_out = stretched[:2, keep_start_out:keep_end_out].T.astype(np.float32, copy=False)
+
+            if out_chunks and fade_n > 0 and len(out_chunks[-1]) and len(chunk_out):
+                f = int(min(fade_n, len(out_chunks[-1]), len(chunk_out)))
+                if f > 0:
+                    out_chunks[-1][-f:] = self._equal_power_blend(out_chunks[-1][-f:], chunk_out[:f])
+                    chunk_out = chunk_out[f:]
+
+            if chunk_out.size:
+                out_chunks.append(chunk_out)
+
+            start_in = center_end_in
+
+        if not out_chunks:
+            return np.zeros((0, 2), dtype=np.float32)
+        out = np.vstack(out_chunks) if len(out_chunks) > 1 else out_chunks[0]
+
+        expected_n = int(round(total_in_n / rate))
+        if expected_n <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if len(out) < expected_n:
+            out = np.vstack([out, np.zeros((expected_n - len(out), 2), dtype=np.float32)])
+        elif len(out) > expected_n:
+            out = out[:expected_n]
+        return out.astype(np.float32, copy=False)
 
     def _encode_output_bytes(self, audio: np.ndarray) -> bytes:
         mime = str(self.output_mime or self.DEFAULT_OUTPUT_MIME).lower().strip()

@@ -53,6 +53,20 @@ def parse_args() -> argparse.Namespace:
         default=512,
         help="Analyzer hop length.",
     )
+    meter_group = parser.add_mutually_exclusive_group()
+    meter_group.add_argument(
+        "--force-4-4",
+        dest="force_beats_per_bar_4",
+        action="store_true",
+        help="Force meter inference to consider only 4 beats per bar (default).",
+    )
+    meter_group.add_argument(
+        "--allow-non-4-4",
+        dest="force_beats_per_bar_4",
+        action="store_false",
+        help="Allow meter inference to consider both 4/4 and 3/4.",
+    )
+    parser.set_defaults(force_beats_per_bar_4=True)
     parser.add_argument(
         "--fixed-prefix-count",
         type=int,
@@ -79,11 +93,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory to save per-track analysis JSON files (default: ./mix_pipeline_outputs/analysis_<variant>).",
     )
-    parser.add_argument(
+    timing_group = parser.add_mutually_exclusive_group()
+    timing_group.add_argument(
         "--enable-timing-logs",
+        dest="enable_timing_logs",
         action="store_true",
-        help="Enable timing logs from analyzer + renderer.",
+        help="Enable timing logs from analyzer + renderer (default).",
     )
+    timing_group.add_argument(
+        "--disable-timing-logs",
+        dest="enable_timing_logs",
+        action="store_false",
+        help="Disable timing logs from analyzer + renderer.",
+    )
+    parser.set_defaults(enable_timing_logs=True)
     parser.add_argument(
         "--enable-renderer-debug-logs",
         action="store_true",
@@ -182,6 +205,7 @@ async def _run_pipeline(
     renderer_variant: str,
     analysis_sr: int,
     hop_length: int,
+    force_beats_per_bar_4: bool,
     fixed_prefix_count: int,
     enable_timing_logs: bool,
     enable_renderer_debug_logs: bool,
@@ -191,6 +215,7 @@ async def _run_pipeline(
     analyzer = analyzer_cls(
         analysis_sr=analysis_sr,
         hop_length=hop_length,
+        force_beats_per_bar_4=force_beats_per_bar_4,
         enable_timing_logs=enable_timing_logs,
     )
     if renderer_variant == "variable_bpm":
@@ -259,6 +284,7 @@ def main() -> int:
             renderer_variant=str(args.renderer),
             analysis_sr=int(args.analysis_sr),
             hop_length=int(args.hop_length),
+            force_beats_per_bar_4=bool(args.force_beats_per_bar_4),
             fixed_prefix_count=int(args.fixed_prefix_count),
             enable_timing_logs=bool(args.enable_timing_logs),
             enable_renderer_debug_logs=bool(args.enable_renderer_debug_logs),
@@ -295,6 +321,7 @@ def main() -> int:
         "renderer_variant": str(args.renderer),
         "analysis_sr": int(args.analysis_sr),
         "hop_length": int(args.hop_length),
+        "force_beats_per_bar_4": bool(args.force_beats_per_bar_4),
         "input_directory": str(input_dir),
         "input_tracks": [
             {

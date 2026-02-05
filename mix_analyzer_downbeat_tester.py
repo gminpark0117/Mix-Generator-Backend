@@ -53,6 +53,20 @@ def parse_args() -> argparse.Namespace:
         choices=["local", "global_hpss"],
         help="Analyzer variant to use: local (section HPSS) or global_hpss (full-track HPSS + CV beat source).",
     )
+    meter_group = parser.add_mutually_exclusive_group()
+    meter_group.add_argument(
+        "--force-4-4",
+        dest="force_beats_per_bar_4",
+        action="store_true",
+        help="Force meter inference to consider only 4 beats per bar (default).",
+    )
+    meter_group.add_argument(
+        "--allow-non-4-4",
+        dest="force_beats_per_bar_4",
+        action="store_false",
+        help="Allow meter inference to consider both 4/4 and 3/4.",
+    )
+    parser.set_defaults(force_beats_per_bar_4=True)
     parser.add_argument("--beat-gain", type=float, default=0.9, help="Gain for normal beat clicks.")
     parser.add_argument("--downbeat-gain", type=float, default=1.2, help="Gain for downbeat clicks.")
     return parser.parse_args()
@@ -196,7 +210,12 @@ def main() -> int:
         format="[%(levelname)s] %(message)s",
     )
     analyzer_cls = MixAnalyzerGlobalHPSS if args.analyzer_variant == "global_hpss" else MixAnalyzer
-    analyzer = analyzer_cls(analysis_sr=int(args.analysis_sr), hop_length=int(args.hop_length), enable_timing_logs=True)
+    analyzer = analyzer_cls(
+        analysis_sr=int(args.analysis_sr),
+        hop_length=int(args.hop_length),
+        force_beats_per_bar_4=bool(args.force_beats_per_bar_4),
+        enable_timing_logs=True,
+    )
     result = asyncio.run(analyzer.analyze(str(input_path), metadata_json))
 
     analysis_json_path.parent.mkdir(parents=True, exist_ok=True)

@@ -46,6 +46,7 @@ class MixAnalyzer:
         energy_curve_points: int = 60,
         switch_region_span_s: float = 30.0,
         boundary_scan_seconds: float = 30.0,
+        force_beats_per_bar_4: bool = True,
         enable_timing_logs: bool = False,
     ) -> None:
         self.analysis_sr = analysis_sr
@@ -55,6 +56,7 @@ class MixAnalyzer:
         self.energy_curve_points = energy_curve_points
         self.switch_region_span_s = max(4.0, float(switch_region_span_s))
         self.boundary_scan_seconds = max(0.0, float(boundary_scan_seconds))
+        self.force_beats_per_bar_4 = bool(force_beats_per_bar_4)
         self.audio_load_res_type = "soxr_hq" if importlib.util.find_spec("soxr") is not None else "kaiser_fast"
         self.enable_timing_logs = enable_timing_logs
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
@@ -83,6 +85,7 @@ class MixAnalyzer:
                 "energy_curve_points": self.energy_curve_points,
                 "switch_region_span_s": self.switch_region_span_s,
                 "boundary_scan_seconds": self.boundary_scan_seconds,
+                "force_beats_per_bar_4": self.force_beats_per_bar_4,
                 "audio_load_res_type": self.audio_load_res_type,
                 "enable_timing_logs": self.enable_timing_logs,
                 "variant_name": self.VARIANT_NAME,
@@ -238,7 +241,10 @@ class MixAnalyzer:
 
         region_span = float(self.switch_region_span_s)
         intro_region = (0.0, min(duration_s, region_span))
-        outro_region = (max(0.0, duration_s - region_span), duration_s)
+        outro_region = (max(0.0, duration_s - 50.0), max(0.0, duration_s - 15.0))
+        if outro_region[1] <= outro_region[0]:
+            # Fallback for very short tracks.
+            outro_region = (max(0.0, duration_s - region_span), duration_s)
 
         step_start = time.perf_counter()
         switch_in_window = self._select_switch_window(
@@ -843,11 +849,12 @@ class MixAnalyzer:
             return meter, signature, beat_positions, downbeats_s
 
         candidate_scores: list[tuple[float, dict[str, Any]]] = []
+        beats_per_bar_candidates = (4,) if self.force_beats_per_bar_4 else (4, 3)
         for tempo_scale in (0.5, 1.0, 2.0):
             beats_scaled = self._scale_beats(beats_s, tempo_scale)
             if len(beats_scaled) < 4:
                 continue
-            for beats_per_bar in (4, 3):
+            for beats_per_bar in beats_per_bar_candidates:
                 phase = self._phase_from_beats(
                     beats_s=beats_scaled,
                     beats_per_bar=beats_per_bar,
@@ -924,43 +931,25 @@ class MixAnalyzer:
         best_bars = 0
 
         for offset in range(beats_per_bar):
-            downbeat_indices = [i for i in range(len(beats_s)) if (i - offset) % beats_per_bar == 0]
-            if len(downbeat_indices) < 2:
-                continue
-            bar_patterns: list[np.ndarray] = []
-            for a, b in zip(downbeat_indices[:-1], downbeat_indices[1:]):
-                bar_start = beats_s[a]
-                bar_end = beats_s[b]
-                pattern = self._resample_onset_pattern(
-                    onset_env=onset_env,
-                    onset_times=onset_times,
-                    start_s=bar_start,
-                    end_s=bar_end,
-                    bins=phase_bins,
-                )
-                if pattern is not None:
-                    bar_patterns.append(pattern)
-            if not bar_patterns:
-                continue
-
-            bars_matrix = np.vstack(bar_patterns)
-            pattern_med = np.median(bars_matrix, axis=0)
-            var = float(np.mean(np.var(bars_matrix, axis=0)))
-
-            downbeat_strength = self._mean_at_times(
-                onset_env,
-                onset_times,
-                [beats_s[i] for i in downbeat_indices],
+            phase = self._phase_metrics_for_offset(
+                beats_s=beats_s,
+                beats_per_bar=beats_per_bar,
+                onset_env=onset_env,
+                onset_times=onset_times,
+                phase_bins=phase_bins,
+                offset=offset,
             )
-            score = downbeat_strength - var
+            if phase is None:
+                continue
+            score = float(phase["score"])
 
             if score > best_score:
                 best_score = score
-                best_pattern = self._normalize_pattern(pattern_med)
-                best_fft = self._fft_mag(best_pattern, n=16)
-                best_var = var
-                best_offset = offset
-                best_bars = len(bar_patterns)
+                best_pattern = phase["pattern"]
+                best_fft = phase["fft_mag"]
+                best_var = float(phase["bar_to_bar_var"])
+                best_offset = int(phase["bar_offset"])
+                best_bars = int(phase["n_bars_used"])
 
         return {
             "score": float(best_score),
@@ -969,6 +958,52 @@ class MixAnalyzer:
             "bar_to_bar_var": float(best_var),
             "n_bars_used": int(best_bars),
             "bar_offset": int(best_offset),
+        }
+
+    def _phase_metrics_for_offset(
+        self,
+        *,
+        beats_s: list[float],
+        beats_per_bar: int,
+        onset_env: Any,
+        onset_times: Any,
+        phase_bins: int,
+        offset: int,
+    ) -> dict[str, Any] | None:
+        downbeat_indices = [i for i in range(len(beats_s)) if (i - offset) % beats_per_bar == 0]
+        if len(downbeat_indices) < 2:
+            return None
+
+        bar_patterns: list[np.ndarray] = []
+        for a, b in zip(downbeat_indices[:-1], downbeat_indices[1:]):
+            bar_start = beats_s[a]
+            bar_end = beats_s[b]
+            pattern = self._resample_onset_pattern(
+                onset_env=onset_env,
+                onset_times=onset_times,
+                start_s=bar_start,
+                end_s=bar_end,
+                bins=phase_bins,
+            )
+            if pattern is not None:
+                bar_patterns.append(pattern)
+        if not bar_patterns:
+            return None
+
+        bars_matrix = np.vstack(bar_patterns)
+        pattern_med = np.median(bars_matrix, axis=0)
+        var = float(np.mean(np.var(bars_matrix, axis=0)))
+
+        # Offset score is based only on bar-to-bar consistency (lower var is better).
+        score = -var
+        pattern_norm = self._normalize_pattern(pattern_med)
+        return {
+            "score": float(score),
+            "pattern": pattern_norm,
+            "fft_mag": self._fft_mag(pattern_norm, n=16),
+            "bar_to_bar_var": float(var),
+            "n_bars_used": int(len(bar_patterns)),
+            "bar_offset": int(offset),
         }
 
     def _signature_from_onset(
