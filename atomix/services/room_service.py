@@ -6,14 +6,17 @@ from datetime import datetime, timezone
 from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from atomix.repos.mix_repo import MixRepo
 from atomix.repos.room_repo import RoomRepo
-from atomix.services.mix_service import MixService, parse_tracks_metadata
+from atomix.schemas.mix import SegmentOut
+from atomix.services.mix_service import MixService
 
 
 class RoomService:
     def __init__(self, db: AsyncSession):
         self.db = db
         self.rooms = RoomRepo(db)
+        self.mixes = MixRepo(db)
         self.mix_svc = MixService(db)
 
     async def create_room(
@@ -67,3 +70,32 @@ class RoomService:
         """Soft-delete a room."""
         async with self.db.begin():
             return await self.rooms.soft_delete_room(room_id)
+
+    async def get_current_segmentout(
+        self,
+        room,
+        *,
+        server_now_epoch_ms: int,
+    ) -> SegmentOut | None:
+        """Resolve currently playing segment for a room at server_now_epoch_ms."""
+        playhead_ms = max(0, server_now_epoch_ms - room.play_started_at_epoch_ms)
+
+        current_revision = await self.mixes.get_current_ready_revision(room.mix_id)
+        if current_revision is None:
+            return None
+
+        row = await self.mixes.get_segment_with_item_metadata_at_playhead(current_revision.id, playhead_ms)
+        if row is None:
+            return None
+
+        position, _mix_item_id, start_ms, end_ms, source_start_ms, metadata_json = row
+        metadata = metadata_json or {}
+
+        return SegmentOut(
+            position=position,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            source_start_ms=source_start_ms,
+            song_name=str(metadata.get("song_name", "")),
+            artist_name=str(metadata.get("artist_name", "")),
+        )

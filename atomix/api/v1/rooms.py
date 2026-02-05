@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Response, 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from atomix.core import get_db
-from atomix.schemas.room import RoomRenameIn, RoomOut, RoomListOut
+from atomix.schemas.room import RoomRenameIn, RoomOut, RoomListOut, RoomListEntryOut
 from atomix.services.room_service import RoomService
 from atomix.runtime.presence import room_presence
 from atomix.api.v1.ws_rooms import _ROOM_RUNTIME, RoomOp, _process_room_ops, RoomRuntime, FileData
@@ -26,6 +26,10 @@ def _build_room_out(room, participant_count: int | None = None) -> RoomOut:
         created_at=room.created_at,
         participant_count=participant_count,
     )
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
 @router.post("", response_model=RoomOut)
@@ -56,7 +60,19 @@ async def list_rooms(
 ) -> RoomListOut:
     svc = RoomService(db)
     rooms = await svc.list_rooms()
-    return RoomListOut(rooms=[_build_room_out(room) for room in rooms])
+    server_now_epoch_ms = _now_ms()
+    out_rooms: list[RoomListEntryOut] = []
+    for room in rooms:
+        participant_count = len(room_presence.get(room.id, set()))
+        segmentout = await svc.get_current_segmentout(room, server_now_epoch_ms=server_now_epoch_ms)
+        out_rooms.append(
+            RoomListEntryOut(
+                room=_build_room_out(room, participant_count=participant_count),
+                current_playing=segmentout,
+            )
+        )
+
+    return RoomListOut(rooms=out_rooms)
 
 
 @router.patch("/{room_id}", response_model=RoomOut)

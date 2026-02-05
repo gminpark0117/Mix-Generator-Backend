@@ -1,72 +1,54 @@
-## Refactor Plan: Add Variable-BPM MixRenderer Variant (tempo ramps during transitions)
+Refactor Plan: Include Current Playing Track (SegmentOut) in GET /v1/rooms
+Goal
+Augment GET /v1/rooms so each returned room includes the current playing track segment (SegmentOut) based on server-calculated playhead:
 
-### Goal
-Add a new renderer variant that keeps each track at its **native BPM outside transitions**, and performs a **tempo ramp only during the transition window**:
-- For `A -> B`, mix tempo stays at `bpm(A)` before transition.
-- During overlap, tempo ramps linearly from `bpm(A)` to `bpm(B)`.
-- After overlap, mix tempo is `bpm(B)`.
+playhead_ms = server_now_epoch_ms - room.play_started_at_epoch_ms
+Look up the room’s mix_id → mix’s current_ready_revision_no → that revision’s segments
+Return the segment where start_ms <= playhead_ms < end_ms as segmentout
+If no segment matches (mix ended / playhead past end), return an explicit “no current track” signal.
+Non-goals:
 
-Keep existing `DeterministicMixRenderer` behavior untouched; the new variant is opt-in (pipeline tester switch).
-
----
-
-### A) New renderer class + selection plumbing
-- Add `VariableBpmMixRenderer` in `atomix/renderers/mix_renderer.py` implementing the same `render(tracks, fixed_tracks)` contract.
-- Keep `PlaceholderMixRenderer` unchanged.
-- Update `mix_pipeline_tester.py` to accept `--renderer {deterministic,variable_bpm}` (default `deterministic`) and instantiate the chosen renderer.
-- Include `renderer_variant` and any new debug fields in the tester’s JSON output for easy comparison.
-
----
-
-### B) Stretching logic (tempo ramp during overlap for BOTH tracks)
-For each transition `A -> B`, both the outgoing overlap of `A` and the incoming overlap of `B`
-must be time-warped so they share the *same instantaneous BPM* throughout the overlap.
-
-- Define the shared tempo curve over the overlap `t∈[0,T]`:
-  - `bpm(t) = bpm_a + (bpm_b - bpm_a) * (t/T)` (linear ramp)
-- Approximate `bpm(t)` deterministically with `K` chunks (e.g. 16/32):
-  - Choose per-chunk target tempo `bpm_k` (use endpoints for k=0/k=K-1 to ensure continuity):
-    - `bpm_0 = bpm_a`, `bpm_{K-1} = bpm_b`
-- Warp outgoing overlap (A) and incoming overlap (B) to the SAME `bpm_k` per chunk:
-  - For A: `rate_out_k = bpm_k / bpm_a`
-  - For B: `rate_in_k  = bpm_k / bpm_b`
-  - Apply `librosa.effects.time_stretch(..., rate_*)` on each chunk, trim/pad so each chunk outputs
-    exactly `overlap_n/K` samples (so both warped overlaps have exactly `overlap_n` samples total).
-- Crossfade the two warped overlaps (equal-power), then append:
-  - `A_before` un-stretched (native bpm_a)
-  - `B_after` un-stretched (native bpm_b)
-
-Continuity:
-- Because `rate_out_0 = 1` and `rate_in_{K-1} = 1`, boundaries between un-stretched audio and warped overlap
-  are continuous in tempo (only the overlap is affected).
----
-
-### C) Transition scoring update (raw BPM delta + feasibility for BOTH sides)
-When evaluating `A -> B` options (choosing which `bpm_b` candidate to use):
-- Tempo delta term uses RAW BPM change:
-  - `delta_raw_pct = abs(bpm_b - bpm_a) / bpm_a * 100`
-- Feasibility/hard penalty must consider BOTH tracks’ required endpoint stretch:
-  - Outgoing end-rate: `end_rate_out = bpm_b / bpm_a`
-  - Incoming start-rate: `start_rate_in = bpm_a / bpm_b`
-  - If either is outside `[MIN_STRETCH_RATE, MAX_STRETCH_RATE]`, treat option as invalid/huge cost
-    (otherwise A and B cannot “agree on BPM always” during overlap under clamp).
-- Secondary penalties unchanged (key/signature/instability), determinism tie-break unchanged.
----
-
-### D) Ordering (DP/greedy) uses the variable-BPM transition costs
-- In `VariableBpmMixRenderer._order_tracks`, build `cost_map[(A,B)]` using the **variable-BPM** transition option’s `total_cost`.
-- Keep the existing Held–Karp DP for small N and deterministic greedy for large N.
-- Fixed prefix handling remains identical.
-
----
-
-### E) Debug + acceptance checks
-Add debug fields to the variable renderer:
-- per transition: `bpm_a`, chosen `bpm_b`, `delta_raw_pct`, `start_rate`, `start_rate_clamped`, `start_match_error_pct`, `K` chunk count.
-- assert determinism: no randomness, stable sorting, consistent rounding.
-
+Do not change WS payload behavior beyond any schema-side optional fields.
+Do not change mix rendering logic.
+A) Schema changes (response contract)
+In room.py, add a list-only room output model:
+RoomListItemOut (room fields + playback fields)
+Fields:
+segmentout: SegmentOut | None (nullable; null means no current playing track)
+is_playing: bool (explicit flag; True iff segmentout is not None)
+Update RoomListOut.rooms to be List[RoomListItemOut] (keep RoomOut unchanged for create/rename/WS).
+B) Data access helpers (avoid duplicating query logic)
+In mix_repo.py, add targeted queries:
+get_current_ready_revision(mix_id) -> MixRevision | None (join mixes → mix_revisions via current_ready_revision_no)
+get_segment_at_playhead(mix_revision_id, playhead_ms) -> (segment fields + item metadata) | None
+SQL filter: start_ms <= playhead_ms AND end_ms > playhead_ms
+Join mix_items for song_name/artist_name (via metadata_json)
+Keep these helpers deterministic (stable ordering; limit 1).
+C) Service-layer assembly (single “compute segmentout” function)
+In room_service.py, add:
+get_room_segmentout(room, *, server_now_epoch_ms: int) -> tuple[SegmentOut | None, bool]
+Logic:
+playhead_ms = max(0, server_now_epoch_ms - room.play_started_at_epoch_ms)
+Fetch current ready revision; if missing → return (None, False)
+Fetch segment at playhead; if missing → return (None, False)
+Build SegmentOut from segment row + metadata; return (segmentout, True)
+Compute server_now_epoch_ms once per request (used for all rooms for consistency).
+D) Endpoint wiring (GET /v1/rooms)
+In rooms.py:
+Update list_rooms to:
+rooms = await svc.list_rooms()
+now_ms = int(datetime.now(timezone.utc).timestamp() * 1000) (or reuse a shared _now_ms() helper)
+For each room:
+segmentout, is_playing = await svc.get_room_segmentout(room, server_now_epoch_ms=now_ms)
+Build RoomListItemOut including segmentout + is_playing + existing room fields (and participant count)
+Keep existing create_room, rename_room, delete_room behavior unchanged.
+E) Docs + acceptance checks
+Update swagger.yaml (or regenerate) so GET /v1/rooms shows the new per-room fields.
 Acceptance:
-- Outside overlap windows, tracks play at native tempo (no full-chunk time-stretch).
-- During overlap, incoming tempo ramps from `bpm_a` to `bpm_b`.
-- Transition scoring minimizes **raw** BPM change magnitude.
-- Pipeline tester can switch renderer variants and produce comparable debug output.
+While mix is mid-play, segmentout matches the segment containing computed playhead.
+After mix ends, response includes segmentout: null and is_playing: false.
+Deterministic: same DB state + same server_now_epoch_ms ⇒ same segmentout.
+Quick manual validation:
+Create a room, immediately call GET /v1/rooms and confirm is_playing=true with a non-null segmentout.
+Temporarily simulate “mix ended” by setting play_started_at_epoch_ms far in the past (DB) and confirm segmentout=null.
+

@@ -352,11 +352,23 @@ components:
       required:
       - name
       title: RoomCreateIn
+    RoomListEntryOut:
+      properties:
+        room:
+          "$ref": "#/components/schemas/RoomOut"
+        current_playing:
+          anyOf:
+          - "$ref": "#/components/schemas/SegmentOut"
+          - type: 'null'
+      type: object
+      required:
+      - room
+      title: RoomListEntryOut
     RoomListOut:
       properties:
         rooms:
           items:
-            "$ref": "#/components/schemas/RoomOut"
+            "$ref": "#/components/schemas/RoomListEntryOut"
           type: array
           title: Rooms
       type: object

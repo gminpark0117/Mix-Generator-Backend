@@ -4,6 +4,8 @@ from datetime import datetime
 from pydantic import BaseModel
 from typing import List
 
+from atomix.schemas.mix import SegmentOut
+
 
 class RoomCreateIn(BaseModel):
     name: str
@@ -20,5 +22,10 @@ class RoomOut(BaseModel):
     participant_count: int = 0
 
 
+class RoomListEntryOut(BaseModel):
+    room: RoomOut
+    current_playing: SegmentOut | None = None
+
+
 class RoomListOut(BaseModel):
-    rooms: List[RoomOut]
+    rooms: List[RoomListEntryOut]

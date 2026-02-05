@@ -114,6 +114,12 @@ class MixRepo:
         )
         return res.scalar_one_or_none()
 
+    async def get_current_ready_revision(self, mix_id: uuid.UUID) -> MixRevision | None:
+        mix = await self.get_mix(mix_id)
+        if mix is None or mix.current_ready_revision_no is None:
+            return None
+        return await self.get_revision_by_no(mix_id, mix.current_ready_revision_no)
+
     async def list_segments_for_revision(self, mix_revision_id: uuid.UUID) -> list[MixSegment]:
         res = await self.db.execute(
             select(MixSegment)
@@ -149,3 +155,30 @@ class MixRepo:
         )
         res = await self.db.execute(stmt)
         return res.all()  # list of Row tuples
+
+    async def get_segment_with_item_metadata_at_playhead(self, mix_revision_id: uuid.UUID, playhead_ms: int):
+        """
+        Returns one row with:
+          position, mix_item_id, start_ms, end_ms, source_start_ms, metadata_json
+        for the segment that contains playhead_ms.
+        """
+        stmt = (
+            select(
+                MixSegment.position,
+                MixSegment.mix_item_id,
+                MixSegment.start_ms,
+                MixSegment.end_ms,
+                MixSegment.source_start_ms,
+                MixItem.metadata_json,
+            )
+            .join(MixItem, MixItem.id == MixSegment.mix_item_id)
+            .where(
+                MixSegment.mix_revision_id == mix_revision_id,
+                MixSegment.start_ms <= playhead_ms,
+                MixSegment.end_ms > playhead_ms,
+            )
+            .order_by(MixSegment.position.asc())
+            .limit(1)
+        )
+        res = await self.db.execute(stmt)
+        return res.first()
